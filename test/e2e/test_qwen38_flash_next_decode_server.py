@@ -4,7 +4,8 @@ rows run the kernels, wider ones the normal path. GSM8K and MMMU against the nor
 path on the same server arguments, with requests joining and leaving a batch that
 steps past 16 rows and back; the tokens of covered steps scored again by the normal
 prefill path (KL consistency), the second turn of a conversation decoding from the
-GDN states the radix cache saved during the first; and a rank stalled by
+GDN states the radix cache saved during the first; each layer's launches against
+SGLang's own layer under SGLANG_AMD_MONO_CHECK; and a rank stalled by
 SGLANG_AMD_MONO_FAULT_INJECT stopping the server without tokens."""
 
 import os
@@ -137,6 +138,119 @@ class TestMonokernelDecode(CustomTestCase):
             max_samples=8,
             max_new_tokens=512,
         )
+
+
+class TestMonokernelCheck(CustomTestCase):
+    def test_each_covered_layer_within_its_numerics(self):
+        # SGLANG_AMD_MONO_CHECK (eager) runs SGLang's layer next to each layer's
+        # launches; with the MXFP4 reference the GDN projections are the launches'
+        # arithmetic, so the bounds hold the kernels' own difference. 1, 3, 9 and 16
+        # rows (ignore_eos: a request that stops at its first token never decodes);
+        # the radix cache on, so the GDN state saves are compared too
+        para = "The river valley archive lists the flood height of every year. "
+        with (
+            tempfile.NamedTemporaryFile("w+", suffix=".out") as out,
+            tempfile.NamedTemporaryFile("w+", suffix=".err") as err,
+        ):
+            process = _launch(
+                extra_env={
+                    "SGLANG_AMD_MONO_CHECK": "1",
+                    "SGLANG_AMD_MONO_CHECK_REF": "mxfp4",
+                },
+                extra_args=["--disable-cuda-graph"],
+                log=(out, err),
+            )
+            try:
+                for n in (1, 3, 9, 16):
+                    r = requests.post(
+                        DEFAULT_URL_FOR_TEST + "/generate",
+                        json={
+                            "text": [f"Record {i}. " + para * 4 for i in range(n)],
+                            "sampling_params": {
+                                "max_new_tokens": 8,
+                                "temperature": 0,
+                                "ignore_eos": True,
+                            },
+                        },
+                        timeout=600,
+                    )
+                    r.raise_for_status()
+            finally:
+                terminate_and_kill_process_tree(process)
+            err.seek(0)
+            out.seek(0)
+            log = err.read() + out.read()
+        steps = re.findall(
+            r"monokernel check step \((\d+) rows, positions \d+\.\.\d+\): (.*)", log
+        )
+        values = {}
+        for _, fields in steps:
+            for name, v in re.findall(r"(\S+)=(\S+)@\d+", fields):
+                values.setdefault(name, []).append(float(v))
+        for name, vs in sorted(values.items()):
+            print(f"{name}: min {min(vs):.6g} max {max(vs):.6g} ({len(vs)} steps)")
+        widths = {int(rows) for rows, _ in steps}
+        self.assertTrue({1, 3, 9, 16} <= widths, sorted(widths))
+        for metric in ("front.mix.cosine", "gdn.core.cosine", "qsa.streams.cosine"):
+            self.assertIn(metric, values)
+        violations = re.findall(r"monokernel check violation: .*", log)
+        self.assertEqual(violations, [], "\n".join(violations[:20]))
+
+
+class TestMonokernelFault(CustomTestCase):
+    def test_a_stalled_rank_stops_the_server_without_tokens(self):
+        # after 1000 steps (startup's graph warmups run two of each width), rank 1
+        # stalls at the first wait of its o_proj and MoE launches; at the deadline
+        # (watchdog / 2) all stop
+        with (
+            tempfile.NamedTemporaryFile("w+", suffix=".out") as out,
+            tempfile.NamedTemporaryFile("w+", suffix=".err") as err,
+        ):
+            process = _launch(
+                extra_env={
+                    "SGLANG_AMD_MONO_FAULT_INJECT": "1:1:1000",
+                    # the stop faults every GPU on purpose: no crash dumps, which
+                    # would hold the ranks up for minutes
+                    "HSA_DISABLE_COREDUMP_ON_EXCEPTION": "1",
+                    "SGLANG_PYSPY_DUMP_BEFORE_CRASH": "0",
+                    "SGLANG_CUDA_COREDUMP_BEFORE_CRASH": "0",
+                },
+                extra_args=["--watchdog-timeout", "20"],
+                log=(out, err),
+            )
+            try:
+                try:
+                    r = requests.post(
+                        DEFAULT_URL_FOR_TEST + "/generate",
+                        json={
+                            "text": "Write a long essay about lighthouses.",
+                            "sampling_params": {
+                                "max_new_tokens": 2048,
+                                "temperature": 0,
+                                "ignore_eos": True,
+                            },
+                        },
+                        timeout=600,
+                    )
+                    ok = r.status_code == 200 and r.json().get("text")
+                except requests.RequestException:
+                    ok = False
+                self.assertFalse(ok, "a failed step's tokens reached the client")
+                deadline = time.time() + 300
+                while process.poll() is None and time.time() < deadline:
+                    time.sleep(2)
+                self.assertIsNotNone(process.poll(), "the server kept running")
+                err.seek(0)
+                out.seek(0)
+                log = err.read() + out.read()
+                # a failed wait stops the launch with a null-page store: faults only at 0x0 / (nil)
+                faults = re.findall(
+                    r"(?:faulting addr: |on address )(0x[0-9a-fA-F]+|\(nil\))", log
+                )
+                self.assertTrue(faults, log[-2000:])
+                self.assertEqual(set(faults) - {"0x0", "(nil)"}, set(), faults)
+            finally:
+                terminate_and_kill_process_tree(process)
 
 
 class TestMonokernelFault(CustomTestCase):

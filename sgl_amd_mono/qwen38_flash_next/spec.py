@@ -31,7 +31,9 @@ states (``check.py``); the bounds in ``NUMERICS`` come from these runs.
 The spec also serves TP2 plain decode of the MXFP4 checkpoint (BF16 attention and
 GDN projections) on per-layer launches (``decode``): SGLang holds one spec an
 architecture, so ``SPEC`` declares both paths' TP sizes and widths, and the TP size
-selects the path's refusals and build (``_PATHS``).
+selects the path's refusals and build (``_PATHS``). There ``SGLANG_AMD_MONO_CHECK=1``
+compares each layer's launches with SGLang's layer instead (``decode/check.py``,
+bounds in ``decode.BOUNDS``).
 """
 
 from __future__ import annotations
