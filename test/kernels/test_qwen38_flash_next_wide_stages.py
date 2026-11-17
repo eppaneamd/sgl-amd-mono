@@ -9,7 +9,9 @@ format, the gated residual (stats, mix, combine), the gated delta net (input
 projection + conv, recurrence + gated norm, out_proj into the exchange),
 the MoE (router, routing, AITER-layout experts in place, combine) and
 qsa_front's projections. test_qwen38_flash_next_wide_exchange.py runs the
-exchange between two ranks on two GPUs.
+exchange between two ranks on two GPUs. Every kernel test runs in both build
+settings (`Setting`): vLLM's, and SGLang's, which reads and writes the conv
+state as [slots, CONV_DIM, 3].
 
 Tolerances: an output rounded to bf16 is within one bf16 ulp (2^-8 relative)
 of the reference rounded at the same points, two where it follows another
@@ -18,6 +20,7 @@ compared as sets: bf16 logits tie at the top-k boundary, so a few rows may
 pick different experts; their outputs are excluded from the MoE bound."""
 
 import sys
+from dataclasses import dataclass
 from pathlib import Path
 
 import pytest
@@ -45,6 +48,41 @@ ROWS = 128
 WIDTHS = [1, 2, 3, 4, 5, 8, 12, 16, 32, 128, 129, *range(136, 193, 8)]
 SMALL = [w for w in WIDTHS if w <= 16]
 CODECS = ["bf16", "int4"]
+
+
+@dataclass(frozen=True)
+class Setting:
+    """A build setting of the kernels (`layer.LayerBuild`): vLLM's, every flag
+    at its default (upstream's code), or SGLang's: the GDN conv state
+    [slots, CONV_DIM, 3] and stop mode at SGLang's deadline at its default
+    `--watchdog-timeout` (`grid`)."""
+
+    name: str
+    conv_dim_first: bool = False
+    stop: bool = False
+    wait_s: float | None = None  # None: `abi.WAIT_SECONDS`
+
+    @property
+    def ticks(self) -> int:
+        from sgl_amd_mono.common.guard import deadline_ticks
+        from sgl_amd_mono.qwen38_flash_next.decode.wide.abi import WAIT_SECONDS
+
+        return deadline_ticks(self.wait_s or WAIT_SECONDS)
+
+    @property
+    def suffix(self) -> str:
+        """The kernel name's: none in vLLM's setting."""
+        return "" if self.name == "vllm" else f"_{self.name}"
+
+
+SETTINGS = pytest.mark.parametrize(
+    "setting",
+    [
+        Setting("vllm"),
+        Setting("sglang", conv_dim_first=True, stop=True, wait_s=60.0),
+    ],
+    ids=lambda s: s.name,
+)
 
 
 def rel(a, b):
@@ -118,12 +156,13 @@ def harness():
 # --------------------------------------------------------------------------
 
 
-def _gemm_kernel(rows, n, k, splits, fmt, fold):
+def _gemm_kernel(setting, rows, n, k, splits, fmt, fold):
     import flydsl.compiler as flyc
     import flydsl.expr as fx
     from flydsl.expr.typing import Int64
 
     default_stream = fx.Stream(None)
+    ticks, stop = setting.ticks, setting.stop
 
     from sgl_amd_mono.qwen38_flash_next.decode.wide.common.grid import (
         Grid,
@@ -147,7 +186,7 @@ def _gemm_kernel(rows, n, k, splits, fmt, fold):
         return tiled.Fp4Weights(w, ws, n, k, shuffled=fmt == "fp4_asm")
 
     @flyc.kernel(
-        name=f"t_gemm_{rows}_{n}_{k}_{splits}_{fmt}_{int(fold)}",
+        name=f"t_gemm_{rows}_{n}_{k}_{splits}_{fmt}_{int(fold)}{setting.suffix}",
         known_block_size=[THREADS, 1, 1],
     )
     def kern(
@@ -167,7 +206,18 @@ def _gemm_kernel(rows, n, k, splits, fmt, fold):
         _ = splits
         tid, bid = fx.thread_idx.x, fx.block_idx.x
         sm = fx.SharedAllocator().allocate(Smem).peek()
-        g = Grid(tid, bid, s0, s1, folds, health, fx.Int64(0), sm.word.ptr)
+        g = Grid(
+            tid,
+            bid,
+            s0,
+            s1,
+            folds,
+            health,
+            fx.Int64(0),
+            sm.word.ptr,
+            ticks=ticks,
+            stop=stop,
+        )
         prologue(g)
         gemm = tiled.Gemm(sm.stage.ptr, rows, tid, k_total=k, chunks=plan.per)
         if fx.const_expr(not fold):
@@ -218,7 +268,7 @@ def _gemm_kernel(rows, n, k, splits, fmt, fold):
     return launch, plan
 
 
-def _check_gemm(harness, rows, n, k, splits, fmt, fold):
+def _check_gemm(harness, setting, rows, n, k, splits, fmt, fold):
     gen = torch.Generator().manual_seed(0)
     x = torch.randn(rows, k, generator=gen).to(torch.bfloat16)
     if fmt == "bf16":
@@ -230,7 +280,7 @@ def _check_gemm(harness, rows, n, k, splits, fmt, fold):
             wd, wsd = packed.cuda(), sc.T.contiguous().cuda()
         else:
             wd, wsd = shuffle_data(packed).cuda(), shuffle_scale(sc).cuda()
-    launch, plan = _gemm_kernel(rows, n, k, splits, fmt, fold)
+    launch, plan = _gemm_kernel(setting, rows, n, k, splits, fmt, fold)
     out = torch.zeros(rows, plan.padded, device="cuda")
     part = torch.zeros(plan.partial_words(rows), device="cuda")
     xd = x.cuda()
@@ -255,11 +305,12 @@ def _check_gemm(harness, rows, n, k, splits, fmt, fold):
     + [(w, "bf16") for w in WIDTHS],
 )
 @pytest.mark.parametrize("fold", [False, True])
-def test_tiled_gemm(harness, rows, fmt, fold):
+@SETTINGS
+def test_tiled_gemm(harness, setting, rows, fmt, fold):
     """`x @ W.T` of the gated residual's down shape (split K, summed in order
     or folded by the last arriver), bf16 or MXFP4 weights in either AITER
     layout: f32 accumulation of exact bf16 products."""
-    _check_gemm(harness, rows, 352, 2560, 4, fmt, fold)
+    _check_gemm(harness, setting, rows, 352, 2560, 4, fmt, fold)
 
 
 @pytest.mark.parametrize("rows", [1, 2, 4, 8, 16])
@@ -271,10 +322,11 @@ def test_tiled_gemm(harness, rows, fmt, fold):
         (192, 320, 1, "bf16", False),
     ],
 )
-def test_tiled_gemm_resident(harness, rows, n, k, splits, fmt, fold):
+@SETTINGS
+def test_tiled_gemm_resident(harness, setting, rows, n, k, splits, fmt, fold):
     """The resident stage of widths up to `tiled.RESIDENT_MAX`: a unit's
     whole K slice (10 chunks, 5 chunks, a ragged K of 320) staged once."""
-    _check_gemm(harness, rows, n, k, splits, fmt, fold)
+    _check_gemm(harness, setting, rows, n, k, splits, fmt, fold)
 
 
 def test_fp4_shuffle_matches_aiter():
@@ -296,12 +348,13 @@ def test_fp4_shuffle_matches_aiter():
 EPS = 1e-6
 
 
-def _hc_kernel(rows, codec="bf16", combine=True, cold=False):
+def _hc_kernel(setting, rows, codec="bf16", combine=True, cold=False):
     import flydsl.compiler as flyc
     import flydsl.expr as fx
     from flydsl.expr.typing import Int64
 
     default_stream = fx.Stream(None)
+    ticks, stop = setting.ticks, setting.stop
 
     from sgl_amd_mono.qwen38_flash_next.decode.wide.common.grid import (
         Grid,
@@ -332,7 +385,7 @@ def _hc_kernel(rows, codec="bf16", combine=True, cold=False):
         word: fx.Array[fx.Int32, 4, 16]
 
     @flyc.kernel(
-        name=f"t_hc_{rows}_{codec}_{int(combine)}_{int(cold)}",
+        name=f"t_hc_{rows}_{codec}_{int(combine)}_{int(cold)}{setting.suffix}",
         known_block_size=[THREADS, 1, 1],
     )
     def kern(
@@ -356,7 +409,18 @@ def _hc_kernel(rows, codec="bf16", combine=True, cold=False):
     ):
         tid, bid = fx.thread_idx.x, fx.block_idx.x
         sm = fx.SharedAllocator().allocate(Smem).peek()
-        g = Grid(tid, bid, s0, s1, folds, health, fx.Int64(0), sm.word.ptr)
+        g = Grid(
+            tid,
+            bid,
+            s0,
+            s1,
+            folds,
+            health,
+            fx.Int64(0),
+            sm.word.ptr,
+            ticks=ticks,
+            stop=stop,
+        )
         prologue(g)
         # past the resident widths the down weights issued during the stats, as
         # the layer kernels do up to ``tiled.PRELOAD_ROWS``
@@ -464,22 +528,24 @@ def _hc_kernel(rows, codec="bf16", combine=True, cold=False):
 
 @pytest.mark.parametrize("codec", CODECS)
 @pytest.mark.parametrize("rows", WIDTHS)
-def test_gated_residual(harness, rows, codec):
+@SETTINGS
+def test_gated_residual(harness, setting, rows, codec):
     """The mix's normalized gated mean and injection scales, the combine's new
     state and its rrms; with `int4` exchange lines the combine adds the
     codec's round trip of the block output."""
-    _check_gated_residual(harness, rows, codec, True)
+    _check_gated_residual(harness, setting, rows, codec, True)
 
 
 @pytest.mark.parametrize("cold", [False, True])
 @pytest.mark.parametrize("rows", [1, 2, 4, 8, 16])
-def test_gated_residual_resident(harness, rows, cold):
+@SETTINGS
+def test_gated_residual_resident(harness, setting, rows, cold):
     """The one-phase mix of the resident widths, its weights issued ahead or
     (`cold`) in the phase, then the combine."""
-    _check_gated_residual(harness, rows, "bf16", True, cold)
+    _check_gated_residual(harness, setting, rows, "bf16", True, cold)
 
 
-def _check_gated_residual(harness, rows, codec, combine, cold=False):
+def _check_gated_residual(harness, setting, rows, codec, combine, cold=False):
     from sgl_amd_mono.qwen38_flash_next.decode.wide.layout import (
         DOWN_ROWS,
         HC,
@@ -510,7 +576,7 @@ def _check_gated_residual(harness, rows, codec, combine, cold=False):
     part = torch.zeros(words, device="cuda")
     down = torch.zeros(rows, 2 * LOWRANK, dtype=torch.bfloat16, device="cuda")
     harness.mbox_t.zero_()
-    _hc_kernel(rows, codec, combine, cold)(
+    _hc_kernel(setting, rows, codec, combine, cold)(
         d["state"].data_ptr(),
         d["norm_w"].data_ptr(),
         d["w_di"].data_ptr(),
@@ -559,7 +625,7 @@ def mailboxes():
     return ptrs, views
 
 
-def _exchange_kernel(rows, codec):
+def _exchange_kernel(setting, rows, codec):
     """Rank `rank` of a two-rank exchange in slot 1: with `push`, its
     partial `y` [rows, HIDDEN] into both mailboxes (a 64-column group a
     CTA, as `gdn.out`'s last arrivers push); with `combine`, the combine
@@ -569,6 +635,7 @@ def _exchange_kernel(rows, codec):
     from flydsl.expr.typing import Int32, Int64
 
     default_stream = fx.Stream(None)
+    ticks, stop = setting.ticks, setting.stop
 
     from sgl_amd_mono.qwen38_flash_next.decode.wide.common.grid import (
         Grid,
@@ -592,7 +659,9 @@ def _exchange_kernel(rows, codec):
         tile: fx.Array[fx.Int32, ex.GroupTile.words(rows), 16]
         word: fx.Array[fx.Int32, 4, 16]
 
-    @flyc.kernel(name=f"t_xch_{rows}_{codec}", known_block_size=[THREADS, 1, 1])
+    @flyc.kernel(
+        name=f"t_xch_{rows}_{codec}{setting.suffix}", known_block_size=[THREADS, 1, 1]
+    )
     def kern(
         y: Int64,
         mbox0: Int64,
@@ -611,7 +680,18 @@ def _exchange_kernel(rows, codec):
     ):
         tid, bid = fx.thread_idx.x, fx.block_idx.x
         sm = fx.SharedAllocator().allocate(Smem).peek()
-        g = Grid(tid, bid, s0, s1, folds, health, fx.Int64(0), sm.word.ptr)
+        g = Grid(
+            tid,
+            bid,
+            s0,
+            s1,
+            folds,
+            health,
+            fx.Int64(0),
+            sm.word.ptr,
+            ticks=ticks,
+            stop=stop,
+        )
         prologue(g)
         bases = [fx.Int64(mbox0), fx.Int64(mbox1)]
         own = (rank == 1).select(bases[1], bases[0])
@@ -672,7 +752,8 @@ def _exchange_kernel(rows, codec):
 
 @pytest.mark.parametrize("codec", CODECS)
 @pytest.mark.parametrize("rows", WIDTHS)
-def test_exchange_two_ranks(harness, mailboxes, rows, codec):
+@SETTINGS
+def test_exchange_two_ranks(harness, mailboxes, setting, rows, codec):
     """Rank 1 pushes, then rank 0 pushes and combines, then rank 1 combines:
     both ranks' new states are the same bits (each decodes both copies, its
     own included, and adds them in rank order) and match the reference; each
@@ -701,7 +782,7 @@ def test_exchange_two_ranks(harness, mailboxes, rows, codec):
     states = [state.cuda() for _ in "01"]
     injd = inj.cuda()
     rrms = [torch.zeros(rows, HC, device="cuda") for _ in "01"]
-    launch = _exchange_kernel(rows, codec)
+    launch = _exchange_kernel(setting, rows, codec)
     for rank, push, combine in ((1, 1, 0), (0, 1, 1), (1, 0, 1)):
         launch(
             yd[rank].data_ptr(),
@@ -754,12 +835,13 @@ def test_exchange_two_ranks(harness, mailboxes, rows, codec):
 # --------------------------------------------------------------------------
 
 
-def _gdn_kernel(rows, out=True):
+def _gdn_kernel(setting, rows, out=True):
     import flydsl.compiler as flyc
     import flydsl.expr as fx
     from flydsl.expr.typing import Int64
 
     default_stream = fx.Stream(None)
+    ticks, stop = setting.ticks, setting.stop
 
     from sgl_amd_mono.qwen38_flash_next.decode.wide.common.grid import (
         Grid,
@@ -783,6 +865,7 @@ def _gdn_kernel(rows, out=True):
     )
 
     chunks = max(gdn.proj_plan().per, gdn.out_plan().per)
+    dim_first = setting.conv_dim_first
 
     @fx.struct
     class Smem:
@@ -791,7 +874,10 @@ def _gdn_kernel(rows, out=True):
         red: fx.Array[fx.Float32, gdn.recur_lds_words(), 16]
         word: fx.Array[fx.Int32, 4, 16]
 
-    @flyc.kernel(name=f"t_gdn_{rows}_{int(out)}", known_block_size=[THREADS, 1, 1])
+    @flyc.kernel(
+        name=f"t_gdn_{rows}_{int(out)}{setting.suffix}",
+        known_block_size=[THREADS, 1, 1],
+    )
     def kern(
         x: Int64,
         wq: Int64,
@@ -820,7 +906,18 @@ def _gdn_kernel(rows, out=True):
     ):
         tid, bid = fx.thread_idx.x, fx.block_idx.x
         sm = fx.SharedAllocator().allocate(Smem).peek()
-        g = Grid(tid, bid, s0, s1, folds, health, fx.Int64(0), sm.word.ptr)
+        g = Grid(
+            tid,
+            bid,
+            s0,
+            s1,
+            folds,
+            health,
+            fx.Int64(0),
+            sm.word.ptr,
+            ticks=ticks,
+            stop=stop,
+        )
         prologue(g)
         w = gdn.Bufs(
             qkvz=wq,
@@ -843,6 +940,7 @@ def _gdn_kernel(rows, out=True):
             conv_state=conv_state,
             ssm=ssm,
             conv_stride=fx.Int64(3 * CONV_DIM),
+            conv_dim_first=dim_first,
             ssm_stride=fx.Int64(NV * 128 * 128),
         )
         # at the resident widths each GEMM's first weights are issued ahead,
@@ -947,23 +1045,25 @@ def _gdn_kernel(rows, out=True):
 
 
 @pytest.mark.parametrize("rows", WIDTHS)
-def test_gated_delta_net(harness, rows):
+@SETTINGS
+def test_gated_delta_net(harness, setting, rows):
     """Conv outputs and states, z, the recurrent states, the gated-norm core
     and out_proj through the exchange; padding rows (slot 0: rows 3 and the
     last, the last alone below five rows, none at one row) leave the states
     alone and give a zero core."""
     pads = sorted({min(3, rows - 1), rows - 1}) if rows > 1 else []
-    _check_gated_delta_net(harness, rows, pads, True)
+    _check_gated_delta_net(harness, setting, rows, pads, True)
 
 
 @pytest.mark.parametrize("rows", [1, 2, 4, 8, 16])
-def test_gated_delta_net_resident(harness, rows):
+@SETTINGS
+def test_gated_delta_net_resident(harness, setting, rows):
     """The gated delta net at the resident widths, out_proj through the
     exchange; the last row of two or more pads."""
-    _check_gated_delta_net(harness, rows, [rows - 1] if rows > 1 else [], True)
+    _check_gated_delta_net(harness, setting, rows, [rows - 1] if rows > 1 else [], True)
 
 
-def _check_gated_delta_net(harness, rows, pads, out):
+def _check_gated_delta_net(harness, setting, rows, pads, out):
     from sgl_amd_mono.qwen38_flash_next.decode.wide.layout import (
         BA,
         CONV_DIM,
@@ -991,6 +1091,9 @@ def _check_gated_delta_net(harness, rows, pads, out):
     conv_r, z_r, cs_r, ssm_r, core_r, y_r = ref.gated_delta_net(
         x, wq, wba, wconv, a_log, dt_bias, normw, wo, st_idx, conv_state, ssm, EPS
     )
+    # between the reference's [slots, 3, CONV_DIM] (vLLM's) and the kernel's
+    # layout: with `conv_dim_first` SGLang's [slots, CONV_DIM, 3], a transpose
+    flip = (lambda t: t.transpose(1, 2)) if setting.conv_dim_first else (lambda t: t)
 
     d = {
         n: v.cuda()
@@ -1006,7 +1109,7 @@ def _check_gated_delta_net(harness, rows, pads, out):
             wo_data=wo_data,
             wo_scale=wo_scale.T.contiguous(),
             st_idx=st_idx,
-            conv_state=conv_state,
+            conv_state=flip(conv_state).contiguous(),
             ssm=ssm,
         ).items()
     }
@@ -1020,7 +1123,7 @@ def _check_gated_delta_net(harness, rows, pads, out):
         device="cuda",
     )
     harness.mbox_t.zero_()
-    _gdn_kernel(rows, out)(
+    _gdn_kernel(setting, rows, out)(
         *[
             d[n].data_ptr()
             for n in (
@@ -1062,7 +1165,7 @@ def _check_gated_delta_net(harness, rows, pads, out):
     core = core.view(torch.bfloat16).view(rows, VALUE_DIM)
     assert rel(qkv, conv_r) < 1e-2
     assert rel(z, z_r) < 1e-2
-    assert rel(d["conv_state"], cs_r) < 1e-2
+    assert rel(flip(d["conv_state"]), cs_r) < 1e-2
     assert rel(d["ssm"], ssm_r) < 1e-2
     assert rel(core, core_r) < 1e-2
     for p in pads:
@@ -1078,12 +1181,13 @@ def _check_gated_delta_net(harness, rows, pads, out):
 RIP = 384  # the padded intermediate of a TP2 rank (320 real)
 
 
-def _moe_kernel(rows, codec="bf16"):
+def _moe_kernel(setting, rows, codec="bf16"):
     import flydsl.compiler as flyc
     import flydsl.expr as fx
     from flydsl.expr.typing import Int64
 
     default_stream = fx.Stream(None)
+    ticks, stop = setting.ticks, setting.stop
 
     from sgl_amd_mono.qwen38_flash_next.decode.wide.common.grid import (
         Grid,
@@ -1115,7 +1219,9 @@ def _moe_kernel(rows, codec="bf16"):
     class Smem:
         word: fx.Array[fx.Int32, 4, 16]
 
-    @flyc.kernel(name=f"t_moe_{rows}_{codec}", known_block_size=[THREADS, 1, 1])
+    @flyc.kernel(
+        name=f"t_moe_{rows}_{codec}{setting.suffix}", known_block_size=[THREADS, 1, 1]
+    )
     def kern(
         x: Int64,
         w_gate: Int64,
@@ -1142,7 +1248,18 @@ def _moe_kernel(rows, codec="bf16"):
         alloc = fx.SharedAllocator()
         sm = alloc.allocate(Smem).peek()
         ph = alloc.allocate(PhaseLds)
-        g = Grid(tid, bid, s0, s1, folds, health, fx.Int64(0), sm.word.ptr)
+        g = Grid(
+            tid,
+            bid,
+            s0,
+            s1,
+            folds,
+            health,
+            fx.Int64(0),
+            sm.word.ptr,
+            ticks=ticks,
+            stop=stop,
+        )
         prologue(g)
         tag = fx.Int32(ld_i32x4(epoch, 0)[0]) * 128 + 9
         gemm = tiled.Gemm(ph.gemm.peek().stage.ptr, rows, tid)
@@ -1311,7 +1428,8 @@ def _skewed_picks(rows, gen):
     + [(w, "random", c) for w in SMALL for c in CODECS]
     + [(w, "hot", "bf16") for w in (1, 4, 12)],
 )
-def test_moe(harness, rows, routing, codec):
+@SETTINGS
+def test_moe(harness, setting, rows, routing, codec):
     """Routing (as sets: bf16 logits tie at the top-k boundary) and weights,
     then the rows whose routing agrees against the reference's MXFP4
     activations; at most a few rows may route differently. Narrow `hot`
@@ -1351,7 +1469,7 @@ def test_moe(harness, rows, routing, codec):
     mpart2 = torch.zeros(rows * SLOTS, HIDDEN, device="cuda")
     flags = torch.zeros(rows * SLOTS, dtype=torch.int32, device="cuda")
     harness.mbox_t.zero_()
-    _moe_kernel(rows, codec)(
+    _moe_kernel(setting, rows, codec)(
         *[d[n].data_ptr() for n in ("x", "w_gate", "w13", "w13s", "w2", "w2s")],
         part.data_ptr(),
         route.data_ptr(),
@@ -1468,7 +1586,8 @@ def small_moe_weights():
         (12, "inactive", "bf16"),
     ],
 )
-def test_moe_small(harness, small_moe_weights, rows, routing, codec):
+@SETTINGS
+def test_moe_small(harness, small_moe_weights, setting, rows, routing, codec):
     """The small-batch MoE path (rows <= `moe.SMALL_MAX`: GEMV router, local
     routing, gate/up pieces, down by output owners into the exchange) against
     the reference, as `test_moe`. `picked`: every row its own 10 experts
@@ -1520,7 +1639,7 @@ def test_moe_small(harness, small_moe_weights, rows, routing, codec):
     mpart2 = torch.zeros(rows * SLOTS, HIDDEN, device="cuda")
     flags = torch.zeros(rows * SLOTS, dtype=torch.int32, device="cuda")
     harness.mbox_t.zero_()
-    _moe_kernel(rows, codec)(
+    _moe_kernel(setting, rows, codec)(
         x.cuda().data_ptr(),
         w_gate.cuda().data_ptr(),
         *[dev[n].data_ptr() for n in ("w13", "w13s", "w2", "w2s")],
@@ -1570,12 +1689,13 @@ def test_moe_small(harness, small_moe_weights, rows, routing, codec):
     assert (flags != 0).sum().item() == 0  # no split marks on this path
 
 
-def _qsa_proj_kernel(rows):
+def _qsa_proj_kernel(setting, rows):
     import flydsl.compiler as flyc
     import flydsl.expr as fx
     from flydsl.expr.typing import Int64
 
     default_stream = fx.Stream(None)
+    ticks, stop = setting.ticks, setting.stop
 
     from sgl_amd_mono.qwen38_flash_next.decode.wide.common.grid import (
         Grid,
@@ -1591,7 +1711,9 @@ def _qsa_proj_kernel(rows):
         stage: fx.Array[fx.Int32, tiled.stage_words(rows, chunks), 16]
         word: fx.Array[fx.Int32, 4, 16]
 
-    @flyc.kernel(name=f"t_qsa_proj_{rows}", known_block_size=[THREADS, 1, 1])
+    @flyc.kernel(
+        name=f"t_qsa_proj_{rows}{setting.suffix}", known_block_size=[THREADS, 1, 1]
+    )
     def kern(
         x: Int64,
         w_qkv: Int64,
@@ -1606,7 +1728,18 @@ def _qsa_proj_kernel(rows):
     ):
         tid, bid = fx.thread_idx.x, fx.block_idx.x
         sm = fx.SharedAllocator().allocate(Smem).peek()
-        g = Grid(tid, bid, s0, s1, folds, health, fx.Int64(0), sm.word.ptr)
+        g = Grid(
+            tid,
+            bid,
+            s0,
+            s1,
+            folds,
+            health,
+            fx.Int64(0),
+            sm.word.ptr,
+            ticks=ticks,
+            stop=stop,
+        )
         prologue(g)
         gemm = tiled.Gemm(sm.stage.ptr, rows, tid, chunks=chunks)
         qsa.proj(g, gemm, w_qkv, w_ix, x, qkv, ix, part, rows)
@@ -1633,7 +1766,8 @@ def _qsa_proj_kernel(rows):
 
 
 @pytest.mark.parametrize("rows", [1, 4, 8, 16, 128, 136, 192])
-def test_qsa_proj(harness, rows):
+@SETTINGS
+def test_qsa_proj(harness, setting, rows):
     """qsa_front's projection phase: `x @ W_qkv.T` and `x @ W_ix.T` (bf16
     weights in vLLM's row-major layout), f32 accumulation of exact bf16
     products rounded to bf16 once, against float64 and against torch's bf16
@@ -1651,7 +1785,7 @@ def test_qsa_proj(harness, rows):
     qkv = torch.full((rows + 1, qsa.QKV), 7.0, dtype=torch.bfloat16, device=dev)
     ix = torch.full((rows + 1, qsa.IX), 7.0, dtype=torch.bfloat16, device=dev)
     part = torch.zeros(qsa.partial_words(rows), device=dev)
-    launch = _qsa_proj_kernel(rows)
+    launch = _qsa_proj_kernel(setting, rows)
     for _ in range(2):  # the fold counters reset themselves
         launch(
             xd.data_ptr(),
