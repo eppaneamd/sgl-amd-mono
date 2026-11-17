@@ -18,15 +18,25 @@ the MoE routing weights) are powers of two, so every product is exact and the
 reference is exact whether or not the compiler fuses a multiply-add. The two ranks'
 states and ``rrms`` must also agree (a digest a launch, compared across ranks).
 
-``--control`` breaks launch ``--control-iter`` on rank 1 to show each check can fail:
-``lost_publish`` (rank 1 publishes its lines to its own mailbox only, so rank 0's
-wait gives up after ``abi.WAIT_TICKS``), ``corrupt_input`` (rank 1's attention
-partial is not the one the reference uses) or ``rank_mismatch`` (rank 1's injection
-scales differ from rank 0's). Writes the per-width records to ``--out`` (JSON)."""
+``--setting`` builds the kernel in vLLM's setting (a wait gives up and the launch runs
+to its end) or SGLang's: stop mode (``grid``) at ``--wait-s`` (default 60 s), with
+every rank's flags in its peer buffer's head, and the fault injection
+(``SGLANG_AMD_MONO_FAULT_INJECT``, ``guard.fault_injection``). In SGLang's setting a
+stop is a deliberate fault, so the worker leaves no core file. ``--progress`` syncs
+after every launch and appends ``<launch> <monotonic s>`` to a file, so a test can
+see when a stopped rank's last launch ended.
+
+``--control`` (vLLM's setting) breaks launch ``--control-iter`` on rank 1 to show
+each check can fail: ``lost_publish`` (rank 1 publishes its lines to its own mailbox
+only, so rank 0's wait gives up after ``abi.WAIT_TICKS``), ``corrupt_input`` (rank
+1's attention partial is not the one the reference uses) or ``rank_mismatch`` (rank
+1's injection scales differ from rank 0's). Writes the per-width records to
+``--out`` (JSON)."""
 
 import argparse
 import json
 import os
+import resource
 import statistics
 import time
 
@@ -41,11 +51,15 @@ POW2 = (0.5, 1.0, 2.0)
 RRMS_REL = 1e-3  # rsqrt of a wave-order sum vs float64
 
 
-def build(rows: int, codec: str):
+def build(rows: int, codec: str, stop=False, wait_s=None, fault=(0, 0)):
+    """The launcher of `rows` and `codec`; `stop`, `wait_s` (None:
+    `abi.WAIT_SECONDS`) and `fault` (site, after) as `layer.LayerBuild`'s."""
     import flydsl.compiler as flyc
     import flydsl.expr as fx
     from flydsl.expr.typing import Int32, Int64
 
+    from sgl_amd_mono.common.guard import deadline_ticks
+    from sgl_amd_mono.qwen38_flash_next.decode.wide.abi import PEER_HEAD, WAIT_SECONDS
     from sgl_amd_mono.qwen38_flash_next.decode.wide.common.grid import (
         Grid,
         grid_sync,
@@ -70,13 +84,18 @@ def build(rows: int, codec: str):
     digest = source_digest()  # FlyDSL does not hash the stages' sources
     small = moe.small(rows)
     default_stream = fx.Stream(None)
+    # scalars, so FlyDSL's key sees them
+    ticks = deadline_ticks(wait_s or WAIT_SECONDS)
+    fault_site, fault_after = fault
+    name = f"t_xch2_{rows}_{codec}" + ("_stop" if stop else "")
+    name += f"_f{fault_site}" if fault_site else ""
 
     @fx.struct
     class Smem:
         tile: fx.Array[fx.Int32, ex.GroupTile.words(rows), 16]
         word: fx.Array[fx.Int32, 4, 16]
 
-    @flyc.kernel(name=f"t_xch2_{rows}_{codec}", known_block_size=[THREADS, 1, 1])
+    @flyc.kernel(name=name, known_block_size=[THREADS, 1, 1])
     def kern(
         y_a: Int64,
         y_m: Int64,
@@ -100,11 +119,28 @@ def build(rows: int, codec: str):
         _ = digest
         tid, bid = fx.thread_idx.x, fx.block_idx.x
         sm = fx.SharedAllocator().allocate(Smem).peek()
-        g = Grid(tid, bid, sync, sync_next, folds, health, alarm, sm.word.ptr)
+        g = Grid(
+            tid,
+            bid,
+            sync,
+            sync_next,
+            folds,
+            health,
+            alarm,
+            sm.word.ptr,
+            ticks=ticks,
+            stop=stop,
+        )
         prologue(g)
         bases = [ld_ptr64(peers, r) for r in range(2)]
         own = (rank == 1).select(bases[1], bases[0])
+        if fx.const_expr(stop):
+            # as layer.build: every rank's flag words, PEER_HEAD bytes before its mailbox
+            head = fx.Int64(PEER_HEAD)
+            g.watch([b - head for b in bases], own - head, rank)
         ep = ld(epoch, 0, fx.Int32)
+        if fx.const_expr(fault_site != 0):
+            g.inject(fault_site, fault_after, ep)
         # layer.build's exchange of `kind` (0 attention, 1 MLP)
         slot_a, tag_a = (layer % 2) * 2, ep * 128 + layer * 2 + 1
         xa = ex.Exchange(bases, own, rank, 2, slot_a, tag_a, rows, codec)
@@ -298,7 +334,7 @@ def run_width(st: Rank, rows: int, codec: str, iters: int, args) -> dict:
     rec = {"rows": rows, "codec": codec, "iters": iters}
     stream = torch.cuda.current_stream()
     t0 = time.perf_counter()
-    launch = build(rows, codec)
+    launch = build(rows, codec, args.stop, args.wait_s, args.fault)
     _preload_compiled(launch, *([0] * 18), stream)
     torch.cuda.synchronize()
     rec["compile_s"] = round(time.perf_counter() - t0, 2)
@@ -322,6 +358,7 @@ def run_width(st: Rank, rows: int, codec: str, iters: int, args) -> dict:
     other_inj = sets[ctrl % SETS]["inj_a"].clone()
     other_inj[0, 0] *= 2
     mism, digests, rr_err, events = [], [], [], []
+    progress = open(args.progress, "a") if args.progress else None  # noqa: SIM115
     torch.cuda.synchronize()
     dist.barrier(st.group)
     t0 = time.perf_counter()
@@ -366,6 +403,10 @@ def run_width(st: Rank, rows: int, codec: str, iters: int, args) -> dict:
         ev[1].record()
         st.launches += 1
         events.append(ev)
+        if progress:
+            torch.cuda.synchronize()
+            progress.write(f"{i} {time.monotonic():.6f}\n")
+            progress.flush()
         mism.append((state.view(torch.int16) != s["ref"].view(rows, -1)).sum())
         digests.append(
             (state.view(torch.int16).flatten().to(torch.int64) * mult).sum()
@@ -374,6 +415,8 @@ def run_width(st: Rank, rows: int, codec: str, iters: int, args) -> dict:
         rr_err.append(((rrms - s["ref_rrms"]).abs() / s["ref_rrms"]).max())
     torch.cuda.synchronize()
     rec["loop_s"] = round(time.perf_counter() - t0, 2)
+    if progress:
+        progress.close()
     mism = torch.stack(mism).cpu()
     mine = torch.stack(digests).cpu()
     rr_err = torch.stack(rr_err).cpu()
@@ -440,10 +483,25 @@ def main():
     )
     ap.add_argument("--control-iter", type=int, default=-1)
     ap.add_argument("--seed", type=int, default=0)
+    ap.add_argument("--setting", choices=("vllm", "sglang"), default="vllm")
+    ap.add_argument("--wait-s", type=float, help="sglang: the deadline (default 60)")
+    ap.add_argument("--progress", help="sync every launch and log it to this file")
     args = ap.parse_args()
     if args.control != "none" and not 0 <= args.control_iter < args.iters:
         ap.error("--control needs --control-iter below --iters")
     rank = args.rank
+    from sgl_amd_mono.common.guard import fault_injection
+
+    args.stop = args.setting == "sglang"
+    args.fault = fault_injection(rank) or (0, 0)
+    if args.stop:
+        args.wait_s = args.wait_s or 60.0
+        if args.control != "none":
+            ap.error("--control breaks a launch in vLLM's setting")
+        # a stop is a deliberate fault
+        resource.setrlimit(resource.RLIMIT_CORE, (0, 0))
+    elif args.wait_s is not None or args.fault != (0, 0):
+        ap.error("--wait-s and SGLANG_AMD_MONO_FAULT_INJECT are SGLang's setting")
     torch.cuda.set_device(rank)
     dev = torch.device("cuda", rank)
     # a file init method: a port picked in advance can be taken before rank 0 listens on it
@@ -459,6 +517,9 @@ def main():
         "HSA_ENABLE_IPC_MODE_LEGACY": os.environ.get("HSA_ENABLE_IPC_MODE_LEGACY"),
         "control": args.control,
         "control_iter": args.control_iter,
+        "setting": args.setting,
+        "wait_s": args.wait_s,
+        "fault": args.fault,
         "records": [],
     }
     for codec in args.codecs.split(","):
