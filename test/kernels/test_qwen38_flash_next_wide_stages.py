@@ -161,6 +161,10 @@ def _gemm_kernel(rows, n, k, splits, fmt, fold):
         folds: Int64,
         health: Int64,
     ):
+        # `splits` reaches the kernel only through `plan`, which FlyDSL's cache
+        # key does not see: without it, builds that differ only in `splits` share
+        # one binary
+        _ = splits
         tid, bid = fx.thread_idx.x, fx.block_idx.x
         sm = fx.SharedAllocator().allocate(Smem).peek()
         g = Grid(tid, bid, s0, s1, folds, health, fx.Int64(0), sm.word.ptr)
