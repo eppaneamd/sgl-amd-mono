@@ -1,0 +1,25 @@
+# SPDX-License-Identifier: Apache-2.0
+"""Qwen3.8-Flash-Next decode steps of 1 to 192 rows at TP2 on the wide kernels of
+vllm-project/vllm#65188 (``wide``): one persistent launch a GDN layer, and two a QSA
+layer around SGLang's QSA attention."""
+
+import os
+
+from sgl_amd_mono.qwen38_flash_next.decode.wide import layout as L
+
+
+def decode_widths(capture_sizes) -> tuple[int, ...]:
+    """The widths that get a build: the decode CUDA graph capture sizes from
+    ``MIN_TOKENS`` to ``MAX_TOKENS`` (SGLang pads a step to the smallest captured
+    width that holds it)."""
+    return tuple(
+        sorted(s for s in set(capture_sizes) if L.MIN_TOKENS <= s <= L.MAX_TOKENS)
+    )
+
+
+def allreduce_codec() -> str:
+    """The TP exchange's line codec: QuickReduce's INT4 codec when the deployment
+    asks SGLang's quick all-reduce for INT4 (``ROCM_QUICK_REDUCE_QUANTIZATION``),
+    else exact bf16 lines."""
+    level = os.environ.get("ROCM_QUICK_REDUCE_QUANTIZATION", "NONE")
+    return "int4" if level == "INT4" else "bf16"
