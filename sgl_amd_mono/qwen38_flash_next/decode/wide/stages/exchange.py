@@ -43,9 +43,11 @@ from flydsl.expr import const_expr
 from flydsl.expr import math as fmath
 from flydsl.expr import range_constexpr
 
-from sgl_amd_mono.qwen38_flash_next.decode.wide.abi import SITE_PEER, WAIT_TICKS
+from sgl_amd_mono.qwen38_flash_next.decode.wide.abi import SITE_PEER
 from sgl_amd_mono.qwen38_flash_next.decode.wide.common.grid import (
+    CHECK_POLLS,
     TraceInvariant,
+    check,
     failed,
     give_up,
 )
@@ -228,32 +230,68 @@ def _int4_encode(vals):
     return codes, scales
 
 
-@traced
 def wait_lines(g, ex, lines):
     """Poll, from every lane, the flags of `lines` (a list of Int32 line
     indices, the lane's own) of every source rank until all carry the tag,
-    bounded. Returns the per (line, source) differences from the tag (zero
-    once the poll ends), to add to the lines' payload loads."""
-    idx = [
+    bounded (`grid`: give up, or in stop mode fault). Returns the per (line,
+    source) differences from the tag (zero once the poll ends), to add to
+    the lines' payload loads."""
+    if g.stop:
+        return _wait_lines_stop(g, ex, lines)
+    return _wait_lines(g, ex, lines)
+
+
+def _flag_index(ex, lines):
+    """Every (line, source rank) flag's word index, line-major."""
+    return [
         ex.flag_index(fx.Int32(src), line)
         for line in lines
         for src in range_constexpr(ex.tp)
     ]
-    t0 = memrealtime()
-    seen = [ld(ex.own, i, fx.Int32, cm=CM_SYS) for i in idx]
+
+
+def _flags(ex, idx):
+    return [ld(ex.own, i, fx.Int32, cm=CM_SYS) for i in idx]
+
+
+def _untagged(ex, seen):
+    """Whether any of the polled flags `seen` lacks the tag."""
     pend = seen[0] != ex.tag
     for v in seen[1:]:
         pend = pend | (v != ex.tag)
+    return pend
+
+
+@traced
+def _wait_lines(g, ex, lines):
+    idx = _flag_index(ex, lines)
+    t0 = memrealtime()
+    seen = _flags(ex, idx)
+    pend = _untagged(ex, seen)
     why = failed(g).select(fx.Int32(2), fx.Int32(0))
     while pend & (why == 0):
-        seen = [ld(ex.own, i, fx.Int32, cm=CM_SYS) for i in idx]
-        pend = seen[0] != ex.tag
-        for v in seen[1:]:
-            pend = pend | (v != ex.tag)
-        late = memrealtime() - t0 > fx.Int64(WAIT_TICKS)
+        seen = _flags(ex, idx)
+        pend = _untagged(ex, seen)
+        late = memrealtime() - t0 > fx.Int64(g.ticks)
         why = late.select(fx.Int32(1), fx.Int32(0))
     if why == 1:
         give_up(g, SITE_PEER, seen[0], ex.tag)
+    return [v - ex.tag for v in seen]
+
+
+@traced
+def _wait_lines_stop(g, ex, lines):
+    idx = _flag_index(ex, lines)
+    t0 = memrealtime()
+    seen = _flags(ex, idx)
+    pend = _untagged(ex, seen)
+    polls = fx.Int32(0)
+    while pend:
+        seen = _flags(ex, idx)
+        pend = _untagged(ex, seen)
+        polls = polls + 1
+        if (polls & fx.Int32(CHECK_POLLS - 1)) == fx.Int32(0):
+            check(g, t0)
     return [v - ex.tag for v in seen]
 
 

@@ -18,7 +18,7 @@ them after every step.
 RECORD_WORDS = 8
 FAILED = 0
 PEER_HEAD = 256  # bytes: the output rank's flags, a word a rank
-WAIT_SECONDS = 10  # an in-kernel wait gives up after this long
+WAIT_SECONDS = 10  # an in-kernel wait gives up after this long (vLLM's setting)
 WAIT_TICKS = WAIT_SECONDS * 100_000_000  # s_memrealtime ticks at 100 MHz
 
 # wait sites a record names

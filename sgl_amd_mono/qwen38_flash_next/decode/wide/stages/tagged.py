@@ -19,8 +19,10 @@ from __future__ import annotations
 
 import flydsl.expr as fx
 
-from sgl_amd_mono.qwen38_flash_next.decode.wide.abi import SITE_FOLD, WAIT_TICKS
+from sgl_amd_mono.qwen38_flash_next.decode.wide.abi import SITE_FOLD
 from sgl_amd_mono.qwen38_flash_next.decode.wide.common.grid import (
+    CHECK_POLLS,
+    check,
     failed,
     give_up,
 )
@@ -73,11 +75,18 @@ def _stale(seen, tag):
     return pend
 
 
-@traced
 def poll(g, specs, tag):
     """The values of every `(addr, first pair, pairs)` of `specs` (pairs 1, 2
     or 4), all re-loaded together until every tag is `tag`; bounded, a
-    timeout recorded as a fold's. Returns per spec its value words (Int32)."""
+    timeout recorded as a fold's (`grid`: or in stop mode a fault). Returns
+    per spec its value words (Int32)."""
+    if g.stop:
+        return _values(specs, _poll_stop(g, specs, tag))
+    return _poll(g, specs, tag)
+
+
+@traced
+def _poll(g, specs, tag):
     seen = _loads(specs)
     t0 = memrealtime()
     pend = _stale(seen, tag)
@@ -85,10 +94,30 @@ def poll(g, specs, tag):
     while pend & (why == 0):
         seen = _loads(specs)
         pend = _stale(seen, tag)
-        late = memrealtime() - t0 > fx.Int64(WAIT_TICKS)
+        late = memrealtime() - t0 > fx.Int64(g.ticks)
         why = late.select(i32(1), i32(0))
     if why == 1:
         give_up(g, SITE_FOLD, seen[0][1], tag)
+    return _values(specs, seen)
+
+
+@traced
+def _poll_stop(g, specs, tag):
+    seen = _loads(specs)
+    t0 = memrealtime()
+    pend = _stale(seen, tag)
+    polls = i32(0)
+    while pend:
+        seen = _loads(specs)
+        pend = _stale(seen, tag)
+        polls = polls + 1
+        if (polls & i32(CHECK_POLLS - 1)) == i32(0):
+            check(g, t0)
+    return seen
+
+
+def _values(specs, seen):
+    """`poll`'s result from the polled pair words."""
     out, i = [], 0
     for _, _, n in specs:
         words = []

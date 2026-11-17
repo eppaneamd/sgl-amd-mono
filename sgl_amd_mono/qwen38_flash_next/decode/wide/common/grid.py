@@ -16,18 +16,28 @@ done by then): `sync` is this launch's slot, `sync_next` the next one's.
 Every CTA must take every barrier of a launch: the kernels run one CTA per
 CU, all co-resident.
 
-Every wait gives up after `WAIT_TICKS`: the CTA records the site in its
-health record, raises its rank's flag on the output rank (`alarm`) and sets
-the rank's FAILED word, so its later waits, and every other CTA's, exit at
-once and the launch runs to its end. The host reads FAILED after the step.
+Every wait gives up after the build's deadline (`Grid.ticks`, by default
+`WAIT_TICKS`): the CTA records the site in its health record, raises its
+rank's flag on the output rank (`alarm`) and sets the rank's FAILED word, so
+its later waits, and every other CTA's, exit at once and the launch runs to
+its end. The host reads FAILED after the step.
+
+Stop mode (`Grid.stop`, SGLang's setting): a wait checks every `CHECK_POLLS`
+polls. Past its deadline it raises its rank's word in every rank's flags
+(`Grid.watch`), drains and faults the launch (`guard.stop_launch`); a set word
+in its own rank's flags faults it too, so after a timeout on one rank every
+other rank faults at its first wait for the stopped rank's data. A launch never
+runs on with words that did not come.
 """
 
 from __future__ import annotations
 
 import flydsl.expr as fx
-from flydsl.expr import rocdl
+from flydsl.expr import const_expr, rocdl
 from flydsl.expr.typing import T
 
+from sgl_amd_mono.common.guard import stop_launch
+from sgl_amd_mono.common.sync import CHECK_POLLS
 from sgl_amd_mono.qwen38_flash_next.decode.wide.abi import (
     FAILED,
     RECORD_WORDS,
@@ -82,9 +92,24 @@ class Grid(TraceInvariant):
     `sync` / `sync_next`: this launch's barrier slot and the next launch's
     (byte addresses); `folds`: the fold counters; `health`: the rank's
     health words; `alarm`: this rank's flag word on the output rank (0:
-    none); `scratch`: an LDS word the CTA's threads share verdicts in."""
+    none); `scratch`: an LDS word the CTA's threads share verdicts in;
+    `ticks`: a wait's deadline in `s_memrealtime` ticks; `stop`: stop mode
+    (the module docstring)."""
 
-    def __init__(self, tid, bid, sync, sync_next, folds, health, alarm, scratch):
+    def __init__(
+        self,
+        tid,
+        bid,
+        sync,
+        sync_next,
+        folds,
+        health,
+        alarm,
+        scratch,
+        *,
+        ticks: int = WAIT_TICKS,
+        stop: bool = False,
+    ):
         self.tid = fx.Int32(tid)
         self.bid = fx.Int32(bid)
         self.lane = self.tid % fx.Int32(64)
@@ -111,6 +136,15 @@ class Grid(TraceInvariant):
         self.mirror = (fx.Int32(WAVES - 1) - self.wave) * fx.Int32(BLOCKS) + (
             fx.Int32(BLOCKS - 1) - self.bid
         )
+        self.ticks, self.stop = ticks, stop
+        self.every, self.flags, self.rank = [], None, None  # `watch`
+
+    def watch(self, every, flags, rank):
+        """Stop mode across ranks: `every` rank's flag words (an int32 a rank,
+        rank order), `flags` this rank's, `rank` its index."""
+        assert self.stop and len(every) <= 4, "stop mode, at most 4 ranks"
+        self.every = [fx.Int64(f) for f in every]
+        self.flags, self.rank = fx.Int64(flags), fx.Int32(rank)
 
 
 @traced
@@ -134,6 +168,44 @@ def failed(g):
 
 
 @traced
+def fail_stop(g):
+    """A stop-mode wait past its deadline: its rank's word in every rank's
+    flags, drained, then the launch's fault."""
+    if const_expr(g.flags is not None):
+        for f in g.every:
+            st(f, g.rank, fx.Int32(1), cm=CM_SYS)
+    rocdl.s_waitcnt(vmcnt=0)
+    stop_launch()
+
+
+def peers_failed(g):
+    """Whether any rank's word in this rank's flags is set (system scope)."""
+    n = len(g.every)
+    words = ld(g.flags, 0, fx.Int32, 1 if n == 1 else 2 if n == 2 else 4, cm=CM_SYS)
+    if n == 1:
+        return words != fx.Int32(0)
+    acc = words[0]
+    for e in range(1, words.numel):
+        acc = acc | words[e]
+    return acc != fx.Int32(0)
+
+
+@traced
+def check(g, t0, leader=None):
+    """A pending stop-mode wait's check (every `CHECK_POLLS` polls): past the
+    deadline from `t0`, `fail_stop` (on the `leader` lanes when given); a set
+    word in this rank's flags faults the launch."""
+    late = memrealtime() - t0 > fx.Int64(g.ticks)
+    if const_expr(leader is not None):
+        late = late & leader
+    if late:
+        fail_stop(g)
+    if const_expr(g.flags is not None):
+        if peers_failed(g):
+            stop_launch()
+
+
+@traced
 def prologue(g):
     """The launch's first act: CTA 0 zeroes the next launch's barrier slot."""
     if (g.bid == 0) & (g.tid < STRIPES):
@@ -148,15 +220,41 @@ def _poll_stripes(g, target):
     lane_word = g.lane * STRIPE_WORDS  # the descriptor base stays wave-uniform
     t0 = memrealtime()
     seen = ld(g.sync, lane_word, fx.Int32, cm=CM_DEV)
-    behind = fx.Int64(rocdl.ballot(T.i64, (seen < target).ir_value()))
+    behind = _behind(seen, target)
     why = failed(g).select(fx.Int32(2), fx.Int32(0))
     while (behind != fx.Int64(0)) & (why == 0):
         seen = ld(g.sync, lane_word, fx.Int32, cm=CM_DEV)
-        behind = fx.Int64(rocdl.ballot(T.i64, (seen < target).ir_value()))
-        late = memrealtime() - t0 > fx.Int64(WAIT_TICKS)
+        behind = _behind(seen, target)
+        late = memrealtime() - t0 > fx.Int64(g.ticks)
         why = late.select(fx.Int32(1), fx.Int32(0))
     if (why == 1) & (g.lane == 0):
         give_up(g, SITE_GRID, seen, target)
+
+
+@traced
+def _poll_stripes_stop(g, target):
+    """`_poll_stripes` in stop mode (lane 0 fails a late wait)."""
+    lane_word = g.lane * STRIPE_WORDS
+    t0 = memrealtime()
+    behind = _behind(ld(g.sync, lane_word, fx.Int32, cm=CM_DEV), target)
+    polls = fx.Int32(0)
+    while behind != fx.Int64(0):
+        behind = _behind(ld(g.sync, lane_word, fx.Int32, cm=CM_DEV), target)
+        polls = polls + 1
+        if (polls & fx.Int32(CHECK_POLLS - 1)) == fx.Int32(0):
+            check(g, t0, g.lane == 0)
+
+
+def _behind(seen, target):
+    """The lanes whose stripe is short of `target` (a wave ballot)."""
+    return fx.Int64(rocdl.ballot(T.i64, (seen < target).ir_value()))
+
+
+def _poll(g, target):
+    if g.stop:
+        _poll_stripes_stop(g, target)
+    else:
+        _poll_stripes(g, target)
 
 
 def grid_sync(g, between=None):
@@ -186,7 +284,7 @@ def _arrive(g):
 @traced
 def _wait(g, target):
     if uniform(g.wave) == 0:
-        _poll_stripes(g, target)
+        _poll(g, target)
     fx.barrier()
     fx.memory_fence(syncscope="workgroup", ordering=fx.AtomicOrdering.Acquire)
 

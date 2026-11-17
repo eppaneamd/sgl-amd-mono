@@ -32,7 +32,9 @@ import torch
 from flydsl.expr import const_expr
 from flydsl.expr.typing import Int32, Int64
 
+from sgl_amd_mono.common.guard import deadline_ticks
 from sgl_amd_mono.common.plan import kernel_sources
+from sgl_amd_mono.qwen38_flash_next.decode.wide.abi import PEER_HEAD, WAIT_SECONDS
 from sgl_amd_mono.qwen38_flash_next.decode.wide.common.grid import (
     Grid,
     TraceInvariant,
@@ -94,6 +96,8 @@ class LayerBuild:
     allreduce: str = "bf16"  # the TP exchange's line codec (``exchange.CODECS``)
     # SGLang's setting; each default is vLLM's (upstream's code)
     conv_dim_first: bool = False  # the GDN conv state [slots, CONV_DIM, 3] (SGLang's)
+    wait_s: float = WAIT_SECONDS  # an in-kernel wait's deadline
+    stop: bool = False  # a timeout faults every rank's launch (``grid``'s stop mode)
 
     def __post_init__(self):
         if self.kind not in KINDS:
@@ -102,6 +106,9 @@ class LayerBuild:
             raise ValueError(f"all-reduce codec {self.allreduce!r}")
         if not 1 <= self.tokens <= MAX_TOKENS:
             raise ValueError(f"{self.tokens} rows: 1 to {MAX_TOKENS}")
+        if not self.wait_s > 0:
+            raise ValueError(f"a {self.wait_s} s wait deadline")
+        deadline_ticks(self.wait_s)  # within the wait's check
         if self.conv_dim_first and self.kind != "gdn":
             raise ValueError("conv_dim_first: only the gdn kind has a conv state")
 
@@ -111,6 +118,7 @@ def kernel_name(key: LayerBuild) -> str:
     name = f"q4w_{key.kind}_s{key.tokens}_tp{key.tp}" + ("_st" if key.stats else "")
     name += "" if key.allreduce == "bf16" else f"_{key.allreduce}"
     name += "_cdf" if key.conv_dim_first else ""
+    name += "_stop" if key.stop else ""
     return name
 
 
@@ -316,6 +324,7 @@ def build(key: LayerBuild):
         part_bytes = scratch_layout(S)["part"][1]
         assert qsa_.partial_words(S) * 4 <= part_bytes, "qsa_proj partials"
     keyed = (*key_tuple(key), ("imports", SOURCES))
+    ticks = deadline_ticks(key.wait_s)
 
     @flyc.kernel(name=kernel_name(key), known_block_size=[THREADS, 1, 1])
     def kernel(
@@ -371,7 +380,18 @@ def build(key: LayerBuild):
         sm = alloc.allocate(Smem).peek()
         ph = alloc.allocate(PhaseLds)
         gl, ml = ph.gemm.peek(), ph.moe.peek()
-        g = Grid(tid, bid, sync, sync_next, folds, health, alarm, sm.word.ptr)
+        g = Grid(
+            tid,
+            bid,
+            sync,
+            sync_next,
+            folds,
+            health,
+            alarm,
+            sm.word.ptr,
+            ticks=ticks,
+            stop=key.stop,
+        )
         prologue(g)
         scr = Scratch(scratch, S)
         aux_f32 = fx.recast_iter(fx.Float32, gl.aux.ptr)
@@ -381,6 +401,10 @@ def build(key: LayerBuild):
         own = bases[0]
         for r in fx.range_constexpr(1, tp):
             own = (rank == r).select(bases[r], own)
+        if const_expr(key.stop):
+            # every rank's flag words: the PEER_HEAD bytes before its mailbox
+            head = fx.Int64(PEER_HEAD)
+            g.watch([b - head for b in bases], own - head, rank)
         ep = ld(epoch, 0, fx.Int32)
         names: list[str] = []
         first = TRACE_BACK if key.kind == "qsa_back" else 0
