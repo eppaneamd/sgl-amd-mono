@@ -98,6 +98,11 @@ class LayerBuild:
     conv_dim_first: bool = False  # the GDN conv state [slots, CONV_DIM, 3] (SGLang's)
     wait_s: float = WAIT_SECONDS  # an in-kernel wait's deadline
     stop: bool = False  # a timeout faults every rank's launch (``grid``'s stop mode)
+    # SGLANG_AMD_MONO_FAULT_INJECT (``guard.fault_injection``), stop mode only: the
+    # wait (1: the launch's first) that stalls to its deadline from epoch
+    # ``fault_after`` (0: none)
+    fault_site: int = 0
+    fault_after: int = 0
 
     def __post_init__(self):
         if self.kind not in KINDS:
@@ -109,6 +114,10 @@ class LayerBuild:
         if not self.wait_s > 0:
             raise ValueError(f"a {self.wait_s} s wait deadline")
         deadline_ticks(self.wait_s)  # within the wait's check
+        if self.fault_site < 0 or self.fault_after < 0:
+            raise ValueError(f"fault injection {self.fault_site}:{self.fault_after}")
+        if self.fault_site and not self.stop:
+            raise ValueError("the fault injection's stall ends in stop mode's fault")
         if self.conv_dim_first and self.kind != "gdn":
             raise ValueError("conv_dim_first: only the gdn kind has a conv state")
 
@@ -119,6 +128,7 @@ def kernel_name(key: LayerBuild) -> str:
     name += "" if key.allreduce == "bf16" else f"_{key.allreduce}"
     name += "_cdf" if key.conv_dim_first else ""
     name += "_stop" if key.stop else ""
+    name += f"_f{key.fault_site}" if key.fault_site else ""
     return name
 
 
@@ -406,6 +416,8 @@ def build(key: LayerBuild):
             head = fx.Int64(PEER_HEAD)
             g.watch([b - head for b in bases], own - head, rank)
         ep = ld(epoch, 0, fx.Int32)
+        if const_expr(key.fault_site != 0):
+            g.inject(key.fault_site, key.fault_after, ep)
         names: list[str] = []
         first = TRACE_BACK if key.kind == "qsa_back" else 0
 

@@ -50,6 +50,7 @@ from sgl_amd_mono.qwen38_flash_next.decode.wide.common.grid import (
     check,
     failed,
     give_up,
+    pending,
 )
 from sgl_amd_mono.qwen38_flash_next.decode.wide.common.ops import (
     CM_SYS,
@@ -237,7 +238,7 @@ def wait_lines(g, ex, lines):
     source) differences from the tag (zero once the poll ends), to add to
     the lines' payload loads."""
     if g.stop:
-        return _wait_lines_stop(g, ex, lines)
+        return _wait_lines_stop(g, ex, lines, g.next_wait())
     return _wait_lines(g, ex, lines)
 
 
@@ -280,13 +281,13 @@ def _wait_lines(g, ex, lines):
 
 
 @traced
-def _wait_lines_stop(g, ex, lines):
+def _wait_lines_stop(g, ex, lines, stall):
     idx = _flag_index(ex, lines)
     t0 = memrealtime()
     seen = _flags(ex, idx)
     pend = _untagged(ex, seen)
     polls = fx.Int32(0)
-    while pend:
+    while pending(pend, stall):
         seen = _flags(ex, idx)
         pend = _untagged(ex, seen)
         polls = polls + 1

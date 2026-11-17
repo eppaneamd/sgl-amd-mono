@@ -25,6 +25,7 @@ from sgl_amd_mono.qwen38_flash_next.decode.wide.common.grid import (
     check,
     failed,
     give_up,
+    pending,
 )
 from sgl_amd_mono.qwen38_flash_next.decode.wide.common.ops import (
     CM_DEV,
@@ -81,7 +82,7 @@ def poll(g, specs, tag):
     timeout recorded as a fold's (`grid`: or in stop mode a fault). Returns
     per spec its value words (Int32)."""
     if g.stop:
-        return _values(specs, _poll_stop(g, specs, tag))
+        return _values(specs, _poll_stop(g, specs, tag, g.next_wait()))
     return _poll(g, specs, tag)
 
 
@@ -102,12 +103,12 @@ def _poll(g, specs, tag):
 
 
 @traced
-def _poll_stop(g, specs, tag):
+def _poll_stop(g, specs, tag, stall):
     seen = _loads(specs)
     t0 = memrealtime()
     pend = _stale(seen, tag)
     polls = i32(0)
-    while pend:
+    while pending(pend, stall):
         seen = _loads(specs)
         pend = _stale(seen, tag)
         polls = polls + 1

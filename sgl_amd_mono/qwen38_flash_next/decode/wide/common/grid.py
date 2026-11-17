@@ -27,7 +27,8 @@ polls. Past its deadline it raises its rank's word in every rank's flags
 (`Grid.watch`), drains and faults the launch (`guard.stop_launch`); a set word
 in its own rank's flags faults it too, so after a timeout on one rank every
 other rank faults at its first wait for the stopped rank's data. A launch never
-runs on with words that did not come.
+runs on with words that did not come. `Grid.inject` stalls one wait for the
+fault injection (`guard.fault_injection`).
 """
 
 from __future__ import annotations
@@ -138,6 +139,8 @@ class Grid(TraceInvariant):
         )
         self.ticks, self.stop = ticks, stop
         self.every, self.flags, self.rank = [], None, None  # `watch`
+        self.fault = None  # `inject`
+        self.waits = 0  # trace-time count of the launch's stop-mode waits
 
     def watch(self, every, flags, rank):
         """Stop mode across ranks: `every` rank's flag words (an int32 a rank,
@@ -145,6 +148,21 @@ class Grid(TraceInvariant):
         assert self.stop and len(every) <= 4, "stop mode, at most 4 ranks"
         self.every = [fx.Int64(f) for f in every]
         self.flags, self.rank = fx.Int64(flags), fx.Int32(rank)
+
+    def inject(self, site, after, epoch):
+        """The fault injection: stop-mode wait `site` (1: the launch's first,
+        counted in trace order, a wait in a traced loop once) polls on until
+        its deadline once `epoch` reaches `after`."""
+        assert self.stop and site > 0, "the injected stall ends in stop mode's fault"
+        self.fault = (site, fx.Int32(epoch) >= fx.Int32(after))
+
+    def next_wait(self):
+        """The next stop-mode wait's stall: the fault injection's armed flag at
+        its site, else None."""
+        self.waits += 1
+        if self.fault is not None and self.fault[0] == self.waits:
+            return self.fault[1]
+        return None
 
 
 @traced
@@ -190,6 +208,11 @@ def peers_failed(g):
     return acc != fx.Int32(0)
 
 
+def pending(pend, stall):
+    """A stop-mode wait's loop condition: `pend`, or the injected stall."""
+    return pend if stall is None else pend | stall
+
+
 @traced
 def check(g, t0, leader=None):
     """A pending stop-mode wait's check (every `CHECK_POLLS` polls): past the
@@ -232,13 +255,13 @@ def _poll_stripes(g, target):
 
 
 @traced
-def _poll_stripes_stop(g, target):
+def _poll_stripes_stop(g, target, stall):
     """`_poll_stripes` in stop mode (lane 0 fails a late wait)."""
     lane_word = g.lane * STRIPE_WORDS
     t0 = memrealtime()
     behind = _behind(ld(g.sync, lane_word, fx.Int32, cm=CM_DEV), target)
     polls = fx.Int32(0)
-    while behind != fx.Int64(0):
+    while pending(behind != fx.Int64(0), stall):
         behind = _behind(ld(g.sync, lane_word, fx.Int32, cm=CM_DEV), target)
         polls = polls + 1
         if (polls & fx.Int32(CHECK_POLLS - 1)) == fx.Int32(0):
@@ -252,7 +275,7 @@ def _behind(seen, target):
 
 def _poll(g, target):
     if g.stop:
-        _poll_stripes_stop(g, target)
+        _poll_stripes_stop(g, target, g.next_wait())
     else:
         _poll_stripes(g, target)
 
