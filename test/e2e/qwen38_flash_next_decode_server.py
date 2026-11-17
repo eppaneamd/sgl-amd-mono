@@ -12,7 +12,9 @@ ENV = {"SGLANG_USE_AITER": "1", "AITER_ONLINE_TUNE": "0"}
 # and the GDN decode on the triton backend (the launches read its metadata). Thinking
 # off: the answers fit the tests' token budgets. Decode graphs up to 192 rows, the
 # launches' largest width (SGLang's default capture sizes up to it). The radix cache
-# stays on: the forward runs SGLang's decode-time GDN state save. Without
+# stays on: the forward runs SGLang's decode-time GDN state save. With it each request
+# holds 5 mamba state slots, and SGLang caps the running requests at the cache's slots
+# / 5 (178 at the default 890 slots), so the cache gets 192 x 5. Without
 # --monokernel-backend, so a test can launch the normal path too.
 ARGS = [
     "--quantization",
@@ -29,6 +31,8 @@ ARGS = [
     "0.85",
     "--max-running-requests",
     "192",
+    "--max-mamba-cache-size",
+    "960",
     "--cuda-graph-max-bs-decode",
     "192",
     "--reasoning-parser",
