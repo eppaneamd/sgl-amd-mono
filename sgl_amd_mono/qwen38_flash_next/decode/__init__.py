@@ -1,7 +1,10 @@
 # SPDX-License-Identifier: Apache-2.0
 """Qwen3.8-Flash-Next decode steps of 1 to 192 rows at TP2 on the wide kernels of
 vllm-project/vllm#65188 (``wide``): one persistent launch a GDN layer, and two a QSA
-layer around SGLang's QSA attention."""
+layer around SGLang's QSA attention. The TP2 path of
+``qwen38_flash_next.spec.SPEC``: its refusals, build and forward in ``spec``, the
+launch state in ``launcher``, the layers' operands in ``weights`` and check mode
+in ``check`` (README.md)."""
 
 import os
 
