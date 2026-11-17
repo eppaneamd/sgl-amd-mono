@@ -39,11 +39,26 @@ SITE_PEER = 2  # abi.SITE_PEER
 # once the epoch reaches 2: launch LAYERS, after a whole step
 FAULT_WAIT_S, OTHER_WAIT_S = 5.0, 60.0
 FAULT_ROWS, FAULT_SITE, FAULT_AFTER, LAYERS = 129, 1, 2, 48
-# a stop's fault, at the null page (`guard.stop_launch`), as ROCr reports it
-# ("... on address %p%s. Reason: %s.", glibc's %p of 0 is "(nil)")
-NULL_FAULT = re.compile(
-    r"Memory access fault by GPU .* on address (\(nil\)|0x0+)(?![0-9a-f])"
+# a GPU memory fault as the runtime reports it: ROCr's "Memory access fault by GPU
+# node-%u (Agent handle: %p) on address %p%s. Reason: %s." (glibc's %p of 0 is
+# "(nil)"), or CLR's "[host: ..., GPU index: %u, faulting addr: 0x%x, kernel: ...]"
+# after its log prefix ":<level>:<file>:<line>: <us> us:", whose stamp is
+# CLOCK_MONOTONIC (``amd::Os::timeNanos``), the clock of the progress files
+ROCR_FAULT = re.compile(
+    r"Memory access fault by GPU node-\d+ .*? on address (\(nil\)|0x[0-9a-fA-F]+)"
 )
+CLR_FAULT = re.compile(
+    r"^:\d+:[^:\n]*:\s*\d+\s*:\s*(\d+) us:[^\n]*?"
+    r"\[(?:host: [^,\]\n]*, )?GPU index: \d+, faulting addr: (0x[0-9a-fA-F]+)",
+    re.M,
+)
+
+
+def faults(log: str) -> list[tuple[int, float | None]]:
+    """Every GPU memory fault `log` reports: (address, monotonic s when CLR
+    reported it; None for ROCr's report, which has no time)."""
+    out = [(0 if a == "(nil)" else int(a, 16), None) for a in ROCR_FAULT.findall(log)]
+    return out + [(int(a, 16), int(us) / 1e6) for us, a in CLR_FAULT.findall(log)]
 
 
 def _gfx950_gpus() -> int:
@@ -183,16 +198,19 @@ def test_a_stalled_rank_faults_both_ranks_by_its_deadline(tmp_path, stalled):
         env={"SGLANG_AMD_MONO_FAULT_INJECT": f"{stalled}:{FAULT_SITE}:{FAULT_AFTER}"},
     )  # fmt: skip
     ends = _wait(procs, hang_s=600)
-    last = []
+    last, stamps = [], []
     for r, p in enumerate(procs):
         log = (tmp_path / f"rank{r}.log").read_text()
-        assert p.returncode != 0 and NULL_FAULT.search(log), (
-            f"rank {r} exited {p.returncode}:\n{log[-3000:]}"
+        found = faults(log)
+        # only stop_launch's faults: at the null page
+        assert p.returncode != 0 and found and all(a == 0 for a, _ in found), (
+            f"rank {r} exited {p.returncode}, faults {found}:\n{log[-3000:]}"
         )
         # every launch of the first step returned, and none after it
         rows = (tmp_path / f"progress{r}").read_text().split()
         assert [int(i) for i in rows[::2]] == list(range(LAYERS)), rows[::2]
         last.append(float(rows[-1]))
+        stamps.append(min((t for _, t in found if t is not None), default=None))
     # the stalled rank: its deadline, from its stalled launch's start, then the
     # runtime's teardown
     took = ends[stalled] - last[stalled]
@@ -200,3 +218,8 @@ def test_a_stalled_rank_faults_both_ranks_by_its_deadline(tmp_path, stalled):
     # the other rank: the stalled rank's flag, not its own deadline
     assert ends[other] - last[other] < OTHER_WAIT_S / 2, ends[other] - last[other]
     assert abs(ends[other] - ends[stalled]) < 15, ends
+    if None not in stamps:
+        # CLR's fault times: the stalled rank at its deadline, the other with it
+        took = stamps[stalled] - last[stalled]
+        assert 0.95 * FAULT_WAIT_S <= took <= FAULT_WAIT_S + 1, took
+        assert abs(stamps[other] - stamps[stalled]) < 1, stamps
