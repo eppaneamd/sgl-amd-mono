@@ -92,6 +92,8 @@ class LayerBuild:
     gdn_eps: float = 1e-6
     trace: bool = False  # CTA 0 stamps the clock at every phase end (``phase_names``)
     allreduce: str = "bf16"  # the TP exchange's line codec (``exchange.CODECS``)
+    # SGLang's setting; each default is vLLM's (upstream's code)
+    conv_dim_first: bool = False  # the GDN conv state [slots, CONV_DIM, 3] (SGLang's)
 
     def __post_init__(self):
         if self.kind not in KINDS:
@@ -100,6 +102,16 @@ class LayerBuild:
             raise ValueError(f"all-reduce codec {self.allreduce!r}")
         if not 1 <= self.tokens <= MAX_TOKENS:
             raise ValueError(f"{self.tokens} rows: 1 to {MAX_TOKENS}")
+        if self.conv_dim_first and self.kind != "gdn":
+            raise ValueError("conv_dim_first: only the gdn kind has a conv state")
+
+
+def kernel_name(key: LayerBuild) -> str:
+    """Upstream's name, with a suffix for each SGLang setting flag that is set."""
+    name = f"q4w_{key.kind}_s{key.tokens}_tp{key.tp}" + ("_st" if key.stats else "")
+    name += "" if key.allreduce == "bf16" else f"_{key.allreduce}"
+    name += "_cdf" if key.conv_dim_first else ""
+    return name
 
 
 ABI = KernelAbi(
@@ -304,10 +316,8 @@ def build(key: LayerBuild):
         part_bytes = scratch_layout(S)["part"][1]
         assert qsa_.partial_words(S) * 4 <= part_bytes, "qsa_proj partials"
     keyed = (*key_tuple(key), ("imports", SOURCES))
-    name = f"q4w_{key.kind}_s{S}_tp{tp}" + ("_st" if key.stats else "")
-    name += "" if key.allreduce == "bf16" else f"_{key.allreduce}"
 
-    @flyc.kernel(name=name, known_block_size=[THREADS, 1, 1])
+    @flyc.kernel(name=kernel_name(key), known_block_size=[THREADS, 1, 1])
     def kernel(
         state: Int64,
         x: Int64,
@@ -520,6 +530,7 @@ def build(key: LayerBuild):
                 st_idx=st_idx,
                 conv_state=conv_state,
                 conv_stride=conv_stride,
+                conv_dim_first=key.conv_dim_first,
                 ssm=ssm,
                 ssm_stride=ssm_stride,
             )

@@ -150,8 +150,9 @@ def proj(g, gemm, w, b, rows: int, fold0: int, pending=None, tag=None):
     """The input projection and its conv. `w`: `qkvz` / `qkvz_s` (MXFP4,
     `shuffled` its layout), `ba` (bf16), `conv` ([CONV_DIM, 4] bf16);
     `b`: `x`, `qkv`, `z`, `ba` (partials), `part`, `st_idx`,
-    `conv_state` (a slot [3, CONV_DIM] bf16, slots `conv_stride` elements
-    apart). Fold counters `fold0 ..`. `pending`: the first unit's weights,
+    `conv_state` (a slot [3, CONV_DIM] bf16, or [CONV_DIM, 3] with
+    `conv_dim_first`, slots `conv_stride` elements apart). Fold counters
+    `fold0 ..`. `pending`: the first unit's weights,
     at the resident widths `proj_issue`'s, else the CTA's
     `tiled.unit_preload` of `proj_weights`.
 
@@ -330,6 +331,23 @@ def conv_loads(w, b, row, tokens, slots=None):
     if slots is None:
         slots = [ld(b.st_idx, tk, fx.Int32, cm=CM_DEV) for tk in tokens]
     live = [sl > 0 for sl in slots]
+    if b.conv_dim_first:
+        # a slot's [CONV_DIM, 3] state (SGLang's): the rows' 12 elements are
+        # contiguous, row-major, 8-byte aligned (`row` is a multiple of 4)
+        sbs = [
+            b.conv_state
+            + (
+                fx.Int64(live[t].select(slots[t], i32(0))) * b.conv_stride
+                + fx.Int64(row * 3)
+            )
+            * fx.Int64(2)
+            for t in range(len(tokens))
+        ]
+        states = [
+            [gld(sbs[t] + fx.Int64(h * 8), fx.Int32, 2) for h in range(3)]
+            for t in range(len(tokens))
+        ]
+        return words, live, sbs, states
     # a slot's [3, CONV_DIM] state, slots ``conv_stride`` elements apart
     sbs = [
         b.conv_state
@@ -344,6 +362,42 @@ def conv_loads(w, b, row, tokens, slots=None):
     return words, live, sbs, states
 
 
+def _elem(s, k):
+    """Element `k` of a token's [4, 3] state words (`conv_dim_first`): its
+    word and half."""
+    return s[k // 4][k // 2 % 2], k % 2
+
+
+def _tap(s, jj, e, dim_first: bool):
+    """Tap `jj` (oldest first) of row `e` of four in a token's `conv_loads`
+    state words, as f32."""
+    word, half = _elem(s, 3 * e + jj) if dim_first else (s[jj][e // 2], e % 2)
+    return _halves(word)[half]
+
+
+def _bits(word, half: int):
+    """Half `half` (0: low) of a packed bf16 pair word as its 16 bits, low."""
+    w = fx.Int32(word)
+    return (w & fx.Int32(0xFFFF)) if half == 0 else w.shrui(fx.Int32(16))
+
+
+def _store_dim_first(sb, s, xs):
+    """The rows' new [4, 3] state `[s1, s2, x]` at `sb`: the kept taps' bits
+    moved as they are, `x` rounded to bf16."""
+    xw = fx.Vector.from_elements(xs, fx.Float32).to(fx.BFloat16).bitcast(fx.Int32)
+    halves = []
+    for e in range(4):
+        halves += [
+            _bits(*_elem(s, 3 * e + 1)),
+            _bits(*_elem(s, 3 * e + 2)),
+            _bits(xw[e // 2], e % 2),
+        ]
+    words = [halves[2 * d] | (halves[2 * d + 1] << 16) for d in range(6)]
+    for h in range(3):
+        pair = fx.Vector.from_elements(words[2 * h : 2 * h + 2], fx.Int32)
+        gst(sb + fx.Int64(h * 8), pair)
+
+
 @traced
 def conv_rows(w, b, rows: int, row, lane, acc, tiles: int, tag=None, loads=None):
     """Projection rows `row .. row + 3` of every token (a fold's summed
@@ -354,6 +408,7 @@ def conv_rows(w, b, rows: int, row, lane, acc, tiles: int, tag=None, loads=None)
     first use. A padding token's lane reads the last token's and stores
     nothing. With `tag` q | k | v and z are stored as tagged pairs
     (`proj`)."""
+    dim_first = b.conv_dim_first
     tokens, valid = _conv_tokens(rows, lane, tiles)
     if row < CONV_DIM:
         if const_expr(loads is None):
@@ -371,7 +426,7 @@ def conv_rows(w, b, rows: int, row, lane, acc, tiles: int, tag=None, loads=None)
             out = []
             for e in range_constexpr(4):
                 sv = [
-                    live[t].select(_halves(s[jj][e // 2])[e % 2], fx.Float32(0.0))
+                    live[t].select(_tap(s, jj, e, dim_first), fx.Float32(0.0))
                     for jj in range(3)
                 ]
                 out.append(
@@ -394,14 +449,17 @@ def conv_rows(w, b, rows: int, row, lane, acc, tiles: int, tag=None, loads=None)
                     at = (tokens[t] * QKVZ + row) // 2
                     tagged.put(b.qkv, at, [packed[0], packed[1]], tag)
                 if live[t]:
-                    gst(sbs[t], s[1])
-                    gst(sbs[t] + fx.Int64(CONV_DIM * 2), s[2])
-                    gst(
-                        sbs[t] + fx.Int64(2 * CONV_DIM * 2),
-                        fx.Vector.from_elements(xs, fx.Float32)
-                        .to(fx.BFloat16)
-                        .bitcast(fx.Int32),
-                    )
+                    if const_expr(dim_first):
+                        _store_dim_first(sbs[t], s, xs)
+                    else:
+                        gst(sbs[t], s[1])
+                        gst(sbs[t] + fx.Int64(CONV_DIM * 2), s[2])
+                        gst(
+                            sbs[t] + fx.Int64(2 * CONV_DIM * 2),
+                            fx.Vector.from_elements(xs, fx.Float32)
+                            .to(fx.BFloat16)
+                            .bitcast(fx.Int32),
+                        )
     else:
         for t in range_constexpr(tiles):
             if valid[t]:
