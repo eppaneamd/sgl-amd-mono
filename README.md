@@ -280,7 +280,8 @@ SGLANG_USE_AITER=1 python -m sglang.launch_server \
 ```
 
 With the aiter attention backend SGLang takes 0.85 of `--mem-fraction-static` (context past 8,192 tokens); at 0.85
-the weights (179 GB with the launches' copies) and the 320 mamba slots (37 GB) leave no KV cache on one GPU.
+the weights (179 GB with the launches' copies) and the 320 mamba slots (34.5 GB) leave no KV cache on one GPU; at 0.95
+the KV cache holds about 760,000 tokens.
 Steps above 64 rows run SGLang's forward. With NEXTN at TP1 the spec runs the verify monokernel above, on the
 FP8-projection checkpoint; each path refuses the other's checkpoint.
 

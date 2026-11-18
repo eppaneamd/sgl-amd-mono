@@ -55,8 +55,8 @@ def _with(args: list[str], values: dict[str, str]) -> list[str]:
 # cap. At most 64 running requests, each with its 5 mamba state slots, and decode
 # graphs up to 64 rows (with the spec's widths, 14 graphs). SGLang takes 0.85 of the
 # static fraction with the aiter attention backend past 8,192 tokens of context: at
-# 0.85 (0.72 of the GPU) the 179 GB of weights and the 37 GB of 320 mamba slots
-# leave no KV cache, at 0.95 (0.81) about 15 GB
+# 0.85 (0.72 of the GPU) the 179 GB of weights and the 34.5 GB of 320 mamba slots
+# leave no KV cache, at 0.95 (0.81) 17.4 GB (760,000 tokens) on one MI350X
 TP1_ARGS = _with(
     ARGS,
     {
