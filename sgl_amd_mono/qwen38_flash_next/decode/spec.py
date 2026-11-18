@@ -219,15 +219,25 @@ BOUNDS = {
 
 # ``SGLANG_AMD_MONO_CHECK_REF=mxfp4``: the reference's GDN projections run the
 # kernels' operands (the MXFP4 copies decoded, bf16 activations), so the GDN
-# metrics without the MoE are held to rounding-order bounds; streams and delta
-# carry the two MoE implementations' difference and are logged only.
+# metrics without the MoE are held to rounding-order bounds. Streams and delta
+# carry the two MoE implementations' difference. In 11 check runs (MI355X and
+# MI350X, 1 to 192 rows, contexts of about 55, 6,000 and 108,000 tokens) their
+# lowest were 0.9926 (streams) and 0.9407 (delta). With a layer broken on purpose
+# (one rank's attention or expert half lost, every attention output zeroed, the
+# router rows shifted by one, the shared expert's gate zeroed) each width's lowest
+# was at most 0.948 and 0.717. Each bound sits midway between the two in
+# log(1 - cosine).
 CHECK_MXFP4_BOUNDS = {
     "qsa.mix.cosine": 0.999,
     "qsa.qkv.cosine": 0.9999,
     "qsa.ix.cosine": 0.9999,
+    "gdn.streams.cosine": 0.98,
+    "gdn.delta.cosine": 0.87,
     "gdn.conv.cosine": 0.9995,
     "gdn.state.cosine": 0.9999,
     "gdn.update.cosine": 0.999,
+    "qsa.streams.cosine": 0.98,
+    "qsa.delta.cosine": 0.87,
     "gdn.track.max_abs": 0.0,
 }
 
