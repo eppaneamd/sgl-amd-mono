@@ -1,6 +1,7 @@
-"""The Qwen3.8-Flash-Next servers that the TP2 decode serving tests launch: two
-MI355X, TP2, the MXFP4 checkpoint (BF16 attention and GDN projections), decode steps
-(no speculative decoding) of up to 192 rows."""
+"""The Qwen3.8-Flash-Next servers that the decode serving tests launch: the MXFP4
+checkpoint (BF16 attention and GDN projections), decode steps (no speculative
+decoding) of up to 192 rows on two MI355X at TP2 (``ARGS``), of up to 64 rows on one
+at TP1 (``TP1_ARGS``)."""
 
 import os
 
@@ -40,3 +41,25 @@ ARGS = [
     "--default-chat-template-kwargs",
     '{"enable_thinking": false}',
 ]
+
+
+def _with(args: list[str], values: dict[str, str]) -> list[str]:
+    """``args`` with the value after each flag of ``values`` replaced."""
+    out = list(args)
+    for flag, value in values.items():
+        out[out.index(flag) + 1] = value
+    return out
+
+
+# TP1 on one MI355X: decode steps of up to 64 rows, vllm-project/vllm#67706's TP1
+# cap. At most 64 running requests, each with its 5 mamba state slots, and decode
+# graphs up to 64 rows (with the spec's widths, 14 graphs)
+TP1_ARGS = _with(
+    ARGS,
+    {
+        "--tp-size": "1",
+        "--max-running-requests": "64",
+        "--max-mamba-cache-size": "320",
+        "--cuda-graph-max-bs-decode": "64",
+    },
+)

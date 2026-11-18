@@ -368,6 +368,23 @@ MODELS = {
         "concurrency": [1, 4, 16, 64, 128, 192],
         "gate_concurrency": [1, 64],
     },
+    "qwen38_flash_next_tp1_decode": {
+        "name": "Qwen3.8-Flash-Next (MXFP4, TP1 decode)",
+        "packages": ["qwen38_flash_next"],
+        "tp": 1,
+        "paths": {
+            "QWEN38_FLASH_NEXT_MXFP4_MODEL_PATH": f"{HF}/amd/Qwen3.8-Flash-Next-Quark-MXFP4"
+        },
+        "recipe": ("qwen38_flash_next_decode_server", "TP1_ARGS"),
+        # the stage tests' TP1 ids run in qwen38_flash_next_tp2's kernel tests
+        "kernel_tests": [],
+        "e2e_tests": ["test/e2e/test_qwen38_flash_next_tp1_decode_server.py"],
+        "microbench": [],
+        "evals": TEXT_EVALS,
+        # decode steps of 1 to 64 rows
+        "concurrency": [1, 4, 16, 64],
+        "gate_concurrency": [1, 16],
+    },
     "muse_spark": {
         "name": "Muse-Spark",
         "packages": ["muse_spark"],
