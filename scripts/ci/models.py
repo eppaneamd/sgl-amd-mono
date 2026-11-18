@@ -381,7 +381,9 @@ MODELS = {
         # the stage tests' TP1 ids run in qwen38_flash_next_tp2's kernel tests
         "kernel_tests": [],
         "e2e_tests": ["test/e2e/test_qwen38_flash_next_tp1_decode_server.py"],
-        "microbench": [],
+        "microbench": [
+            "torchrun --nproc-per-node 1 test/kernels/qwen38_flash_next/time_layers.py --kind model --rows 1,16,64"
+        ],
         "evals": TEXT_EVALS,
         # decode steps of 1 to 64 rows
         "concurrency": [1, 4, 16, 64],

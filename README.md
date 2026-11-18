@@ -386,7 +386,7 @@ Kernel-only time of a DeepSeek-V4.1-Flash layer: `torchrun --nproc-per-node 4 te
 
 Kernel-only time of the GLM-5.3-Flash launches (no model needed): `torchrun --nproc-per-node 4 test/kernels/glm53_flash/time_layers.py --kind model --rows 2,4,8` (`--kind full` for the whole served step: layer 0 from the tokens, the dense layers, layers 3 to 44 and the tail).
 
-Kernel-only time of the Qwen3.8-Flash-Next TP2 decode launches (no model needed): `torchrun --nproc-per-node 2 test/kernels/qwen38_flash_next/time_layers.py --kind model --rows 1,16,64,192` (`--kind gdn`, `qsa_front` or `qsa_back` for one kind's launches).
+Kernel-only time of the Qwen3.8-Flash-Next decode launches (no model needed): `torchrun --nproc-per-node 2 test/kernels/qwen38_flash_next/time_layers.py --kind model --rows 1,16,64,192` at TP2, `--nproc-per-node 1 ... --rows 1,16,64` at TP1 (`--kind gdn`, `qsa_front` or `qsa_back` for one kind's launches).
 
 ## Contributing
 
