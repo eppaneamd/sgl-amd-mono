@@ -47,9 +47,10 @@ WIDTHS = sorted(w for w in SPEC.devices["gfx950"].widths if w <= 64)
 # Score drops against the normal path that fail the run: bounds for gross failures
 GSM8K_DROP = 0.03
 MMMU_DROP = 0.05
-# Decode against prefill, mean KL a batch: the TP2 tests' bound (from their measured
-# ranges, test_qwen38_flash_next_decode_server.py); not yet measured at TP1
-KL_BOUND = 0.12
+# Decode against prefill, one batch of test_b's 1 to 64 LongBench-v2 prompts at a time,
+# mean KL a batch: 0.014 to 0.081 on the normal path (3 runs, one server), 0.024 to
+# 0.113 with the monokernels (3 runs, one server), on one MI350X
+KL_BOUND = 0.14
 # 72 requests at a time, more than the server runs: its batches fill to the largest
 # width, 64 rows
 THREADS = 72
