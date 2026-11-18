@@ -56,11 +56,11 @@ def test_every_bound_names_a_metric_the_check_records():
 def test_check_bounds_by_reference():
     assert D.check_bounds("bf16") == dict(D.BOUNDS)
     mx = D.check_bounds("mxfp4")
-    # the metrics without the MoE, each at least as tight as against the bf16
-    # reference
+    # every metric bounded; the metrics without the MoE each at least as tight as
+    # against the bf16 reference
+    assert set(mx) == METRICS
     cos = {f"gdn.{o}.cosine" for o in ("conv", "state", "update")}
     cos |= {f"qsa.{o}.cosine" for o in ("mix", "qkv", "ix")}
-    assert set(mx) == cos | {"gdn.track.max_abs"}
     assert all(mx[k] >= D.BOUNDS[k] for k in cos)
     assert mx["gdn.track.max_abs"] == D.BOUNDS["gdn.track.max_abs"] == 0.0
 

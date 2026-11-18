@@ -5,8 +5,9 @@ decode graph runs them. GSM8K and MMMU against the normal path on the same serve
 arguments, with requests joining and leaving batches of up to 192 rows; the tokens of covered steps scored again by the normal prefill path (KL
 consistency), the second turn of a conversation decoding from the GDN states the
 radix cache saved during the first; each layer's launches against SGLang's own layer
-under SGLANG_AMD_MONO_CHECK; and a rank stalled by SGLANG_AMD_MONO_FAULT_INJECT
-stopping the server without tokens."""
+under SGLANG_AMD_MONO_CHECK, at 1 to 192 rows and at contexts past QSA's 2,048-token
+selection budget (about 6,000 and 108,000 tokens); and a rank stalled by
+SGLANG_AMD_MONO_FAULT_INJECT stopping the server without tokens."""
 
 import os
 import re
@@ -51,8 +52,16 @@ KL_BOUND = 0.12
 # 200 requests at a time, more than the server runs: its batches fill to the
 # largest width, 192 rows
 THREADS = 200
-# Check mode: one batch a width, from 1 row to the largest
-CHECK_ROWS = (1, 4, 16, 64, 128, 192)
+# Check mode: batches of (rows, paragraphs of 12 tokens): one a width from 1 row to
+# the largest at about 55 tokens, then contexts QSA's indexer selects from (past its
+# budget of 2,048 tokens): about 6,000 tokens at 1, 16 and 64 rows, and about 108,000
+# at 1 and 4
+CHECK_BATCHES = (
+    *((rows, 4) for rows in (1, 4, 16, 64, 128, 192)),
+    *((rows, 500) for rows in (1, 16, 64)),
+    *((rows, 9000) for rows in (1, 4)),
+)
+PARAGRAPH = "The river valley archive lists the flood height of every year. "
 CHECK_METRICS = (
     "gdn.streams.cosine",
     "gdn.delta.cosine",
@@ -187,11 +196,11 @@ class TestMonokernelCheck(CustomTestCase):
     def test_each_covered_layer_within_its_numerics(self):
         # SGLANG_AMD_MONO_CHECK (eager) runs SGLang's layer next to each layer's
         # launches; with the MXFP4 reference the GDN projections are the launches'
-        # arithmetic, so the bounds hold the kernels' own difference. One batch a
-        # width (ignore_eos: a request that stops at its first token never decodes);
-        # the radix cache on, so the GDN state saves are compared where a step
-        # tracks one (gdn.track)
-        para = "The river valley archive lists the flood height of every year. "
+        # arithmetic, so the bounds hold the kernels' own difference (streams and
+        # delta: with the two MoE implementations'). One batch at a time
+        # (ignore_eos: a request that stops at its first token never decodes); the
+        # radix cache on, so the GDN state saves are compared where a step tracks
+        # one (gdn.track)
         with (
             tempfile.NamedTemporaryFile("w+", suffix=".out") as out,
             tempfile.NamedTemporaryFile("w+", suffix=".err") as err,
@@ -205,11 +214,14 @@ class TestMonokernelCheck(CustomTestCase):
                 log=(out, err),
             )
             try:
-                for n in CHECK_ROWS:
+                for rows, paragraphs in CHECK_BATCHES:
                     r = requests.post(
                         DEFAULT_URL_FOR_TEST + "/generate",
                         json={
-                            "text": [f"Record {i}. " + para * 4 for i in range(n)],
+                            "text": [
+                                f"Record {i}. " + PARAGRAPH * paragraphs
+                                for i in range(rows)
+                            ],
                             "sampling_params": {
                                 "max_new_tokens": 16,
                                 "temperature": 0,
@@ -222,17 +234,32 @@ class TestMonokernelCheck(CustomTestCase):
             finally:
                 terminate_and_kill_process_tree(process)
             log = _logs((out, err))
-        steps = re.findall(
-            r"monokernel check step \((\d+) rows, positions \d+\.\.\d+\): (.*)", log
-        )
+        steps = [
+            (int(rows), int(first), int(last), fields)
+            for rows, first, last, fields in re.findall(
+                r"monokernel check step \((\d+) rows, positions (\d+)\.\.(\d+)\): (.*)",
+                log,
+            )
+        ]
         values = {}
-        for _, fields in steps:
+        for rows, first, _, fields in steps:
+            context = "long" if first >= 2048 else "short"
             for name, v in re.findall(r"(\S+)=(\S+)@\d+", fields):
                 values.setdefault(name, []).append(float(v))
+                values.setdefault(f"{name} ({context})", []).append(float(v))
         for name, vs in sorted(values.items()):
             print(f"{name}: min {min(vs):.6g} max {max(vs):.6g} ({len(vs)} steps)")
-        widths = {int(rows) for rows, _ in steps}
-        self.assertTrue(set(CHECK_ROWS) <= widths, sorted(widths))
+        # each batch's steps ran at its rows and its context: a prompt's decode
+        # positions start past its paragraphs, by the record number's few tokens
+        for rows, paragraphs in CHECK_BATCHES:
+            low, high = 12 * paragraphs, 12 * paragraphs + 64
+            self.assertTrue(
+                any(
+                    r == rows and low <= first <= last <= high
+                    for r, first, last, _ in steps
+                ),
+                (rows, paragraphs, sorted({(r, f) for r, f, _, _ in steps})),
+            )
         for metric in CHECK_METRICS:
             self.assertIn(metric, values)
         violations = re.findall(r"monokernel check violation: .*", log)
