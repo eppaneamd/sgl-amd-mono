@@ -14,6 +14,7 @@ from unittest import mock
 import pytest
 import sglang
 import torch
+from qwen38_flash_next_decode_fakes import quant_config
 from sglang.srt.model_executor.forward_batch_info import ForwardMode
 
 try:
@@ -58,7 +59,7 @@ TEXT = SimpleNamespace(
 VL = SimpleNamespace(
     text_config=TEXT,
     architectures=[TARGET],
-    quantization_config={"quant_method": "quark"},
+    quantization_config=quant_config(projections="fp8_e4m3"),
 )
 # the NEXTN recipe's server arguments the spec reads
 CFG = SimpleNamespace(context_length=None)
@@ -445,6 +446,8 @@ def test_the_recipe_is_accepted():
             True,
         ),
         (CFG, _replace(VL, quantization_config={"quant_method": "fp8"}), True),
+        # amd/Qwen3.8-Flash-Next-Quark-MXFP4: bf16 projections
+        (CFG, _replace(VL, quantization_config=quant_config()), True),
         (
             CFG,
             _replace(VL, text_config=_replace(TEXT, mamba_ssm_dtype="float16")),
@@ -459,6 +462,7 @@ def test_the_recipe_is_accepted():
         "index budget",
         "layer pattern",
         "quantization",
+        "bf16 projections",
         "ssm dtype",
         "context",
         "no flydsl",

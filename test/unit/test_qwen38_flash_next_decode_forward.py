@@ -9,14 +9,14 @@ from types import SimpleNamespace as NS
 
 import pytest
 import torch
-from qwen38_flash_next_decode_fakes import meta
+from qwen38_flash_next_decode_fakes import RIP, meta
 
 try:
     from sglang.kernels.plugin_kernels.amd import spec as registry
 except ModuleNotFoundError:  # SGLang before sgl-project/sglang#45389
     from sglang.srt.monokernels import spec as registry
 
-from sgl_amd_mono.qwen38_flash_next.decode import check, launcher
+from sgl_amd_mono.qwen38_flash_next.decode import check, decode_widths, launcher
 from sgl_amd_mono.qwen38_flash_next.decode import spec as D
 from sgl_amd_mono.qwen38_flash_next.decode.weights import Layer
 from sgl_amd_mono.qwen38_flash_next.decode.wide import layer as K
@@ -62,7 +62,7 @@ def _launcher(widths=(1, 2), kinds=KINDS, rank=0, deadline_s=30.0, tp=2):
         rank=rank,
         group=None,
         device=torch.device("cpu"),
-        rip=512,
+        rip=RIP[tp],
         deadline_s=deadline_s,
         make_peers=_Peers,
     )
@@ -377,6 +377,30 @@ def test_a_routed_step_runs_every_launch_in_sglang_s_order(sglang):
     _step(built, fb)
     assert [e[1] for e in sglang.log if e[0] == "state"] == [0, 1, 2, 4] * 2
     assert sglang.epochs == [1] * 6 + [2] * 6
+
+
+class _Lm:
+    """A model whose own forward (SGLang's) records that it ran."""
+
+    def __init__(self):
+        self.model, self.ran = NS(), []
+
+    def forward(self, *args):
+        self.ran.append(args)
+        return "the model's forward"
+
+
+@pytest.mark.parametrize("rows", [72, 192])
+def test_a_tp1_step_wider_than_its_builds_runs_the_models_forward(sglang, rows):
+    # the spec declares the decode widths to 192, TP1 builds them to 64: SGLang
+    # routes the wider steps here when it captures (or, eager, runs) them
+    la = _launcher(widths=decode_widths(D.WIDTHS, 1), tp=1)
+    assert max(la.widths) == 64
+    lm = _Lm()
+    out = D._Built(lm, la).forward(_plan(rows), "ids", "positions", "batch")
+    assert out == "the model's forward"
+    assert lm.ran == [("ids", "positions", "batch", False, None)]
+    assert sglang.runs == [] and sglang.epochs == []
 
 
 def test_the_projections_are_sglang_s_again_after_a_failure(sglang):

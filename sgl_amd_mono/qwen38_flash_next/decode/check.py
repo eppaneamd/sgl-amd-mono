@@ -1,5 +1,5 @@
 # SPDX-License-Identifier: Apache-2.0
-"""SGLANG_AMD_MONO_CHECK=1 on the TP2 decode path (eager decode only): each layer of
+"""SGLANG_AMD_MONO_CHECK=1 on the decode path (eager decode only): each layer of
 a routed step also runs SGLang's decoder layer on the same input streams and GDN
 states, and the launches' outputs are compared with it:
 

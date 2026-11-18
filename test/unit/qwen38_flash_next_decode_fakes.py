@@ -1,12 +1,18 @@
-"""A Qwen3.8-Flash-Next model as the TP2 decode unit tests read it: namespaces
-holding meta tensors in the per-rank shapes SGLang loads at TP2, and the text config
+"""A Qwen3.8-Flash-Next model as the decode unit tests read it: namespaces holding
+meta tensors in the per-rank shapes SGLang loads at TP1 or TP2, and the text config
 and server args the spec checks."""
 
 from types import SimpleNamespace as NS
 
 import torch
 
+from sgl_amd_mono.qwen38_flash_next import PROJECTIONS
 from sgl_amd_mono.qwen38_flash_next.decode.weights import E2M1
+from sgl_amd_mono.qwen38_flash_next.decode.wide import layout as L
+
+# the experts' intermediate SGLang pads a rank's 640 / TP rows to for AITER's MXFP4
+# MoE, by TP (``get_moe_weight_sizes``)
+RIP = {1: 768, 2: 512}
 
 
 def meta(*shape, dtype=torch.bfloat16):
@@ -53,17 +59,18 @@ def _moe(rip: int):
     )
 
 
-def _gdn_layer(rip: int):
+def _gdn_layer(rip: int, sh):
     return NS(
         linear_attn=NS(
+            # SGLang's output sizes are the unsharded projection's
             in_proj_qkvz=NS(
-                weight=meta(8192, 2560), output_sizes=[2048, 2048, 6144, 6144]
+                weight=meta(sh.QKVZ, 2560), output_sizes=[2048, 2048, 6144, 6144]
             ),
-            in_proj_ba=NS(weight=meta(48, 2560)),
-            conv1d=NS(weight=meta(5120, 1, 4), bias=None),
-            out_proj=NS(weight=meta(2560, 3072)),
-            A_log=meta(24, dtype=torch.float32),
-            dt_bias=meta(24, dtype=torch.float32),
+            in_proj_ba=NS(weight=meta(sh.BA, 2560)),
+            conv1d=NS(weight=meta(sh.CONV_DIM, 1, 4), bias=None),
+            out_proj=NS(weight=meta(2560, sh.VALUE_DIM)),
+            A_log=meta(sh.NV, dtype=torch.float32),
+            dt_bias=meta(sh.NV, dtype=torch.float32),
             norm=NS(
                 weight=meta(128),
                 eps=1e-6,
@@ -80,10 +87,10 @@ def _gdn_layer(rip: int):
     )
 
 
-def _qsa_layer(rip: int):
+def _qsa_layer(rip: int, sh):
     return NS(
-        o_proj=NS(weight=meta(2560, 3072)),
-        qkv_proj=NS(weight=meta(6656, 2560)),
+        o_proj=NS(weight=meta(2560, sh.QSA_CORE)),
+        qkv_proj=NS(weight=meta(sh.QKV, 2560)),
         indexer=NS(index_qk_proj=NS(weight=meta(640, 2560))),
         attn_output_gate=True,
         is_qsa=True,
@@ -94,17 +101,20 @@ def _qsa_layer(rip: int):
     )
 
 
-def fake_model(rip: int = 512):
-    """48 layers, QSA at i % 4 == 3, PLE on layer 1, with the experts padded to
-    ``rip``."""
-    layers = [_qsa_layer(rip) if i % 4 == 3 else _gdn_layer(rip) for i in range(48)]
+def fake_model(rip: int | None = None, tp: int = 2):
+    """48 layers, QSA at i % 4 == 3, PLE on layer 1, in a TP ``tp`` rank's shapes,
+    with the experts padded to ``rip`` (SGLang's, ``RIP``, by default)."""
+    sh, rip = L.shard(tp), rip or RIP[tp]
+    layers = [
+        _qsa_layer(rip, sh) if i % 4 == 3 else _gdn_layer(rip, sh) for i in range(48)
+    ]
     layers[1].ple = NS()
     return NS(
         model=NS(layers=layers, hyper_connection_mixer=_hc()), is_mrope_enabled=True
     )
 
 
-# Qwen3.8-Flash-Next's text config fields the TP2 path checks
+# Qwen3.8-Flash-Next's text config fields the decode path checks
 TEXT_CONFIG = {
     "hidden_size": 2560,
     "hc_count": 4,
@@ -126,16 +136,37 @@ TEXT_CONFIG = {
 }
 
 
-def hf_config(quant="quark", **text):
+def quant_config(quant="quark", projections="bf16"):
+    """A Quark config's entries for the GDN and attention projections: excluded
+    (bf16), as amd/Qwen3.8-Flash-Next-Quark-MXFP4 has them, or FP8 by layer
+    pattern, as its -AttnFP8-PLEFP8 variant."""
+    fp4 = {"weight": {"dtype": "fp4"}}
+    if projections == "bf16":
+        return {
+            "quant_method": quant,
+            "global_quant_config": fp4,
+            "exclude": ["lm_head", *PROJECTIONS],
+            "layer_quant_config": {},
+        }
+    fp8 = {"weight": {"dtype": projections}}
+    return {
+        "quant_method": quant,
+        "global_quant_config": fp4,
+        "exclude": ["lm_head"],
+        "layer_quant_config": {"*linear_attn.*": fp8, "*self_attn.*": fp8},
+    }
+
+
+def hf_config(quant="quark", projections="bf16", **text):
     return NS(
         architectures=["Qwen4ExpForConditionalGeneration"],
         text_config=NS(**{**TEXT_CONFIG, **text}),
-        quantization_config={"quant_method": quant},
+        quantization_config=quant_config(quant, projections),
     )
 
 
 def server_args(**overrides):
-    """A TP2 decode server's arguments the spec reads."""
+    """A TP2 decode server's arguments the spec reads (``tp_size=1`` a TP1 one's)."""
     return NS(
         **{
             "tp_size": 2,

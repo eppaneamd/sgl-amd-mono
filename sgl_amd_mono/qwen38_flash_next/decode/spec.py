@@ -1,8 +1,9 @@
 # SPDX-License-Identifier: Apache-2.0
-"""Qwen3.8-Flash-Next (SGLang's Qwen4-Exp) on gfx950 at TP2: the decode path of
-``qwen38_flash_next.spec.SPEC`` (RFC sgl-project/sglang#43949), which routes TP2
-servers here. Plain decode (no speculative decoding) of the MXFP4 checkpoint with
-BF16 attention and GDN projections, 1 to 192 rows a step.
+"""Qwen3.8-Flash-Next (SGLang's Qwen4-Exp) on gfx950 at TP1 or TP2: the decode
+path of ``qwen38_flash_next.spec.SPEC`` (RFC sgl-project/sglang#43949), which routes
+TP2 servers and TP1 servers without speculative decoding here. Plain decode of the
+MXFP4 checkpoint with BF16 attention and GDN projections, 1 to 192 rows a step at
+TP2 and 1 to 64 at TP1; a step of another width runs SGLang's forward.
 
 A routed decode step runs ``_Built.forward`` in place of
 ``Qwen4ExpForConditionalGeneration.forward``, in the order SGLang's forward runs:
@@ -35,18 +36,18 @@ from contextlib import contextmanager
 
 import torch
 
+from sgl_amd_mono.qwen38_flash_next import projection_dtypes
 from sgl_amd_mono.qwen38_flash_next.decode import decode_widths
 from sgl_amd_mono.qwen38_flash_next.decode.weights import is_gdn, moe_rip, scale_cols
 from sgl_amd_mono.qwen38_flash_next.decode.wide import layout as L
 
 logger = logging.getLogger(__name__)
 
-# the TP sizes the spec routes here (the kernels are built for ``L.TPS``); TP1 runs
-# the NEXTN verify path
-TP_SIZES = (2,)
+TP_SIZES = L.TPS
 # SGLang's decode CUDA graph capture sizes without speculative decoding up to
 # MAX_TOKENS (``generate_decode_cuda_graph_batch_sizes``), which the binding makes
-# the capture sizes up to the server's largest (``covered_capture_sizes``)
+# the capture sizes up to the server's largest (``covered_capture_sizes``); a TP
+# builds those up to its ``Shard.MAX_TOKENS`` (``decode_widths``)
 WIDTHS = (1, 2, 4, 8, 12, *range(16, L.MAX_TOKENS + 1, 8))
 # The server arguments this path accepts on top of ``SPEC.requires``, checked as
 # SGLang checks those
@@ -244,7 +245,7 @@ def _text(config):
 
 
 def config_disable_reasons(cfg, hf_config) -> list[str]:
-    """What the TP2 decode path refuses before load, past ``SERVER_ARGS``."""
+    """What the decode path refuses before load, past ``SERVER_ARGS``."""
     from sglang.srt.configs.mamba_utils import mamba2_state_dtype
 
     text = _text(hf_config)
@@ -258,6 +259,12 @@ def config_disable_reasons(cfg, hf_config) -> list[str]:
     quant = (getattr(hf_config, "quantization_config", None) or {}).get("quant_method")
     if quant != "quark":
         reasons.append(f"needs the Quark MXFP4 checkpoint, got {quant!r}")
+    elif (dtypes := projection_dtypes(hf_config)) != {"bf16"}:
+        reasons.append(
+            f"GDN and attention projections {sorted(dtypes)}: the decode launches "
+            "read the bf16 ones of amd/Qwen3.8-Flash-Next-Quark-MXFP4 (the "
+            "FP8-projection checkpoint runs TP1 with NEXTN)"
+        )
     dtypes = mamba2_state_dtype(hf_config)
     if dtypes.temporal != torch.float32 or dtypes.conv != torch.bfloat16:
         reasons.append(
@@ -682,6 +689,17 @@ class _Built:
 
         model, la = self.model, self.la
         lm, rows = model.model, plan.key.rows
+        if rows not in la.st_idx:
+            # a width the spec declares and this TP does not build (TP1 above
+            # 64 rows): SGLang's forward
+            return type(model).forward(
+                model,
+                input_ids,
+                positions,
+                forward_batch,
+                get_embedding,
+                pp_proxy_tensors,
+            )
         lab = get_attn_backend().linear_attn_backend
         md = lab.forward_metadata
         if plan.key not in self.first_seen:  # shapes only: no host sync
@@ -765,7 +783,12 @@ def build(model, hf_config, ctx) -> _Built:
 
     p = get_parallel()
     tp, rank, group = p.tp_size, p.tp_rank, p.tp_group.cpu_group
-    widths = decode_widths(ctx.widths)
+    widths = decode_widths(ctx.widths, tp)
+    if not widths:  # e.g. TP1 with only capture sizes above 64
+        raise ValueError(
+            f"Qwen3.8-Flash-Next monokernel: none of the widths {list(ctx.widths)} "
+            f"is in 1-{L.shard(tp).MAX_TOKENS}, the TP{tp} launches'"
+        )
     layers = _on_every_rank(
         lambda: weights.build_layers(model, ctx.copies),
         group,
@@ -796,12 +819,15 @@ def build(model, hf_config, ctx) -> _Built:
         "compiling the kernels",
     )
     built = _Built(model, la)
+    other = sorted(set(ctx.widths) - set(widths))
     logger.info(
-        "Qwen3.8-Flash-Next monokernel: %d builds for widths %s, %d launches a "
-        "step, %s TP all-reduce lines, wait deadline %.0f s, experts padded to %d; "
-        "check mode %s",
+        "Qwen3.8-Flash-Next monokernel: TP%d, %d builds for widths %s%s, %d "
+        "launches a step, %s TP all-reduce lines, wait deadline %.0f s, experts "
+        "padded to %d; check mode %s",
+        tp,
         len(keys),
         list(widths),
+        f" (the declared widths {other} run SGLang's forward)" if other else "",
         la.launches,
         la.codec,
         ctx.deadline_s,

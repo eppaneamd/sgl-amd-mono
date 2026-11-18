@@ -90,8 +90,9 @@ def moe_rip(w13: torch.Tensor, w2: torch.Tensor, ri: int) -> int:
 
     w13 [E', 2 RIP, H / 2] holds gate rows [0, RI) and up rows [RIP, RIP + RI); w2
     [E', H, RIP / 2]; one byte per two FP4 values. SGLang pads the packed bytes to
-    128 (``get_moe_weight_sizes``: RIP 512 at RI 320). The kernels take RIP as the
-    weights' stride, in 128-row steps, and read w2's K to RI rounded up to 128.
+    128 (``get_moe_weight_sizes``: RIP 512 at RI 320, 768 at RI 640). The kernels
+    take RIP as the weights' stride, in 128-row steps, and read w2's K to RI rounded
+    up to 128.
     """
     if w13.element_size() != 1 or w2.element_size() != 1:
         raise ValueError(f"expert weights are not packed FP4: {w13.dtype}, {w2.dtype}")
