@@ -61,11 +61,12 @@ PROJECTIONS = (
 
 def projection_dtypes(hf_config) -> set[str]:
     """The weight dtypes the checkpoint's Quark config gives the GDN and attention
-    projections (``PROJECTIONS``), resolved as SGLang's Quark config resolves a
-    layer's: bf16 when excluded (by name, or a ``re:`` pattern), else the first
-    matching ``layer_quant_config`` pattern's, else the global config's.
-    amd/Qwen3.8-Flash-Next-Quark-MXFP4 gives {'bf16'}, its -AttnFP8-PLEFP8
-    variant {'fp8_e4m3'}."""
+    projections (``PROJECTIONS``), by the steps of SGLang's Quark config the two
+    checkpoints use: bf16 when excluded (by name, or a ``re:`` pattern), else the
+    first matching ``layer_quant_config`` pattern's, else the global config's
+    (SGLang's ``layer_type_quant_config`` and requantization are not resolved; the
+    paths' weight checks after load decide those). amd/Qwen3.8-Flash-Next-Quark-MXFP4
+    gives {'bf16'}, its -AttnFP8-PLEFP8 variant {'fp8_e4m3'}."""
     quant = getattr(hf_config, "quantization_config", None) or {}
     exclude = quant.get("exclude") or ()
     layers = quant.get("layer_quant_config") or {}
