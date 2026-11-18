@@ -6,7 +6,6 @@ from types import SimpleNamespace as NS
 
 import torch
 
-from sgl_amd_mono.qwen38_flash_next import PROJECTIONS
 from sgl_amd_mono.qwen38_flash_next.decode.weights import E2M1
 from sgl_amd_mono.qwen38_flash_next.decode.wide import layout as L
 
@@ -136,6 +135,29 @@ TEXT_CONFIG = {
 }
 
 
+# amd/Qwen3.8-Flash-Next-Quark-MXFP4's Quark exclude entries for layers 0 (GDN)
+# and 3 (QSA), copied from its config.json: a name in ``PROJECTIONS`` the checkpoint
+# does not use resolves to the global FP4 config, and the decode path refuses it
+MXFP4_EXCLUDE = [
+    "lm_head",
+    *(
+        f"model.language_model.layers.0.linear_attn.{m}"
+        for m in (
+            "conv1d",
+            "in_proj_a",
+            "in_proj_b",
+            "in_proj_qkv",
+            "in_proj_z",
+            "out_proj",
+        )
+    ),
+    *(
+        f"model.language_model.layers.3.self_attn.{m}"
+        for m in ("indexer.index_qk_proj", "k_proj", "o_proj", "q_proj", "v_proj")
+    ),
+]
+
+
 def quant_config(quant="quark", projections="bf16"):
     """A Quark config's entries for the GDN and attention projections: excluded
     (bf16), as amd/Qwen3.8-Flash-Next-Quark-MXFP4 has them, or FP8 by layer
@@ -145,7 +167,7 @@ def quant_config(quant="quark", projections="bf16"):
         return {
             "quant_method": quant,
             "global_quant_config": fp4,
-            "exclude": ["lm_head", *PROJECTIONS],
+            "exclude": MXFP4_EXCLUDE,
             "layer_quant_config": {},
         }
     fp8 = {"weight": {"dtype": projections}}

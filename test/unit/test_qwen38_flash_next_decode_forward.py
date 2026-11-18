@@ -1,9 +1,9 @@
-"""The Qwen3.8-Flash-Next TP2 decode on CPU: the launch state's builds and
-arguments (``launcher.Launcher``), a routed step's launch sequence on a recording
-``wide.layer.run``, SGLang's PLE and QSA calls in SGLang's order with qsa_front's
-projections fed to SGLang's attention, the radix track-save after the GDN
-launches, the GDN state binding, the check mode's per-layer calls, and the build's
-compile order and settings."""
+"""The Qwen3.8-Flash-Next decode on CPU, at TP2 unless a test names TP1: the launch
+state's builds and arguments (``launcher.Launcher``), a routed step's launch
+sequence on a recording ``wide.layer.run``, SGLang's PLE and QSA calls in SGLang's
+order with qsa_front's projections fed to SGLang's attention, the radix track-save
+after the GDN launches, the GDN state binding, the check mode's per-layer calls, and
+the build's compile order and settings."""
 
 from types import SimpleNamespace as NS
 

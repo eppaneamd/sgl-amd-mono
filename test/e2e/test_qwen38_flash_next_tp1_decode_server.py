@@ -166,6 +166,12 @@ class TestMonokernelDecode(CustomTestCase):
             log,
         )
         self.assertIn(f"monokernel: TP1, {4 * len(WIDTHS)} builds for widths", log)
+        # SGLang's line counts the widths routed to the plugin, and a routed width TP1
+        # does not build runs SGLang's forward: each width logs its first step on the
+        # launches, and the build line leaves no width to SGLang's forward
+        for w in WIDTHS:
+            self.assertIn(f"monokernel: first decode step of {w} rows", log)
+        self.assertNotIn("run SGLang's forward", log)
 
     def test_b_covered_steps_match_prefill(self):
         # one graph per batch (ignore_eos keeps its rows); 3, 13, 17 and 33 rows one

@@ -1,4 +1,4 @@
-"""The Qwen3.8-Flash-Next TP2 decode check mode on CPU: its metrics against the
+"""The Qwen3.8-Flash-Next decode check mode on CPU: its metrics against the
 path's bounds, the worst value kept per metric, the radix track-save comparison,
 the fed QSA projections against SGLang's, and the MXFP4 reference's GDN projections
 on stand-ins for SGLang's GDN modules."""

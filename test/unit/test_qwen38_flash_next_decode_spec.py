@@ -266,6 +266,9 @@ def test_config_reasons_need_flydsl(flydsl, clean_env):
 def test_the_tp_size_and_speculative_decoding_select_the_path(tp, algorithm, path):
     want = {"verify": S._VERIFY, "decode": S._DECODE, None: None}[path]
     assert S._route(tp, algorithm) is want
+
+
+def test_each_path_holds_its_own_checks_and_build():
     assert S._VERIFY == (
         S.VERIFY_SERVER_ARGS,
         S._config_disable_reasons,
