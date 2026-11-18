@@ -272,12 +272,15 @@ SGLANG_USE_AITER=1 python -m sglang.launch_server \
   --tp 1 \
   --linear-attn-backend triton \
   --moe-runner-backend aiter \
+  --mem-fraction-static 0.95 \
   --max-running-requests 64 \
   --max-mamba-cache-size 320 \
   --cuda-graph-max-bs-decode 64 \
   --monokernel-backend amd
 ```
 
+With the aiter attention backend SGLang takes 0.85 of `--mem-fraction-static` (context past 8,192 tokens); at 0.85
+the weights (179 GB with the launches' copies) and the 320 mamba slots (37 GB) leave no KV cache on one GPU.
 Steps above 64 rows run SGLang's forward. With NEXTN at TP1 the spec runs the verify monokernel above, on the
 FP8-projection checkpoint; each path refuses the other's checkpoint.
 
