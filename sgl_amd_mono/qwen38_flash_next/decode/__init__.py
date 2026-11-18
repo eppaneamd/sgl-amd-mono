@@ -20,10 +20,12 @@ def decode_widths(capture_sizes) -> tuple[int, ...]:
     )
 
 
-def allreduce_codec() -> str:
+def allreduce_codec(tp: int) -> str:
     """The TP exchange's line codec: exact bf16 lines, or QuickReduce's INT4 codec
     when ``ROCM_QUICK_REDUCE_QUANTIZATION`` is INT4. SGLang's own all-reduce of a
     decode step stays exact at these sizes (below QuickReduce's minimum), so INT4
-    is lossy here where SGLang is not."""
+    is lossy here where SGLang is not. At TP1 the exchange is a round trip through
+    the rank's own mailbox and SGLang runs no all-reduce: bf16 whatever the
+    setting."""
     level = os.environ.get("ROCM_QUICK_REDUCE_QUANTIZATION", "NONE")
-    return "int4" if level == "INT4" else "bf16"
+    return "int4" if tp > 1 and level == "INT4" else "bf16"

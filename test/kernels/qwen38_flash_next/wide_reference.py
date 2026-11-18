@@ -3,7 +3,7 @@
 # Adapted from vllm-project/vllm#65188 at 294644b81e (Apache-2.0):
 # tests/models/qwen4_exp/amd_specialized_decode/reference.py
 """Float64 references of the wide decode's stages with the stock path's bf16
-rounding points (`bf`), at Qwen3.8-Flash-Next's TP2 shapes."""
+rounding points (`bf`), at Qwen3.8-Flash-Next's TP1 or TP2 shapes."""
 
 import torch
 import torch.nn.functional as F

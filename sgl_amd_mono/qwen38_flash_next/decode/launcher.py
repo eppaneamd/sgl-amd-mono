@@ -75,7 +75,7 @@ class Launcher:
             raise ValueError(
                 f"{self.launches} launches a step: the barrier slots need an even count"
             )
-        self.codec = allreduce_codec()
+        self.codec = allreduce_codec(tp)
         self.fault = guard.fault_injection(rank) or NO_FAULT
         top = max(self.widths)
         # zeroed: the MoE's split-unit marks are compared against step tags

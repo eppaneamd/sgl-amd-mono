@@ -8,7 +8,8 @@ GPU (the TP exchange with one rank): the batch-tiled GEMM on each weight
 format, the gated residual (stats, mix, combine), the gated delta net (input
 projection + conv, recurrence + gated norm, out_proj into the exchange),
 the MoE (router, routing, AITER-layout experts in place, combine) and
-qsa_front's projections. test_qwen38_flash_next_wide_exchange.py runs the
+qsa_front's projections; the last three, whose shapes depend on the TP, also
+at TP1 (ids `tp1-...`). test_qwen38_flash_next_wide_exchange.py runs the
 exchange between two ranks on two GPUs. Every kernel test runs in both build
 settings (`Setting`): vLLM's, and SGLang's, which reads and writes the conv
 state as [slots, CONV_DIM, 3].
@@ -48,6 +49,17 @@ ROWS = 128
 WIDTHS = [1, 2, 3, 4, 5, 8, 12, 16, 32, 128, 129, *range(136, 193, 8)]
 SMALL = [w for w in WIDTHS if w <= 16]
 CODECS = ["bf16", "int4"]
+
+
+def tp_cases(tp2, tp1):
+    """`pytest.param`s `(tp, *case)`: TP2's cases keep the ids they have
+    without `tp`, TP1's are `tp1-<case>`."""
+    params = []
+    for tp, cases, prefix in ((2, tp2, ""), (1, tp1, "tp1-")):
+        for case in cases:
+            case = case if isinstance(case, tuple) else (case,)
+            params.append(pytest.param(tp, *case, id=prefix + "-".join(map(str, case))))
+    return params
 
 
 @dataclass(frozen=True)
@@ -1045,9 +1057,9 @@ def _gdn_kernel(setting, sh, rows, out=True):
     return launch
 
 
-@pytest.mark.parametrize("rows", WIDTHS)
+@pytest.mark.parametrize("tp, rows", tp_cases(WIDTHS, (32, 64)))
 @SETTINGS
-def test_gated_delta_net(harness, setting, rows):
+def test_gated_delta_net(harness, setting, tp, rows):
     """Conv outputs and states, z, the recurrent states, the gated-norm core
     and out_proj through the exchange; padding rows (slot 0: rows 3 and the
     last, the last alone below five rows, none at one row) leave the states
@@ -1055,18 +1067,18 @@ def test_gated_delta_net(harness, setting, rows):
     from sgl_amd_mono.qwen38_flash_next.decode.wide.layout import shard
 
     pads = sorted({min(3, rows - 1), rows - 1}) if rows > 1 else []
-    _check_gated_delta_net(harness, setting, shard(2), rows, pads, True)
+    _check_gated_delta_net(harness, setting, shard(tp), rows, pads, True)
 
 
-@pytest.mark.parametrize("rows", [1, 2, 4, 8, 16])
+@pytest.mark.parametrize("tp, rows", tp_cases([1, 2, 4, 8, 16], (1, 16)))
 @SETTINGS
-def test_gated_delta_net_resident(harness, setting, rows):
+def test_gated_delta_net_resident(harness, setting, tp, rows):
     """The gated delta net at the resident widths, out_proj through the
     exchange; the last row of two or more pads."""
     from sgl_amd_mono.qwen38_flash_next.decode.wide.layout import shard
 
     pads = [rows - 1] if rows > 1 else []
-    _check_gated_delta_net(harness, setting, shard(2), rows, pads, True)
+    _check_gated_delta_net(harness, setting, shard(tp), rows, pads, True)
 
 
 def _check_gated_delta_net(harness, setting, sh, rows, pads, out):
@@ -1180,7 +1192,10 @@ def _check_gated_delta_net(harness, setting, sh, rows, pads, out):
 # the MoE: router, routing + activation quant, experts in place, combine
 # --------------------------------------------------------------------------
 
-RIP = {2: 384}  # the experts' padded intermediate a rank, by TP (TP2: 320 real)
+# the experts' padded intermediate a rank, by TP (real: 320 at TP2, 640 at TP1):
+# vLLM's 128-row steps, where SGLang pads the packed bytes (512 at TP2, 768 at
+# TP1); at TP1's 640 the last wave's scale pair ends at the projection's end
+RIP = {1: 640, 2: 384}
 
 
 def _moe_kernel(setting, sh, rows, codec="bf16"):
@@ -1335,31 +1350,6 @@ def _moe_kernel(setting, sh, rows, codec="bf16"):
     return launch
 
 
-def _expert_weights(gen, experts, rows, k, rows_real, k_real):
-    """MXFP4 experts [experts, rows, k] in AITER's shuffled layouts, zero past
-    `rows_real` rows of each half (`rows` covers two) and past `k_real`:
-    (data, scales [experts, rows, pad8(k / 32)], dequantized f32)."""
-    codes = torch.randint(0, 16, (experts, rows, k), generator=gen, dtype=torch.uint8)
-    codes[:, :, k_real:] = 0
-    cols = (k // 32 + 7) // 8 * 8
-    sc = torch.full((experts, rows, cols), 127, dtype=torch.uint8)
-    sc[:, :, : k // 32] = torch.randint(
-        118, 124, (experts, rows, k // 32), generator=gen, dtype=torch.uint8
-    )
-    half = rows // 2 if rows_real < rows else rows
-    for h in range(rows // half):
-        codes[:, h * half + rows_real : (h + 1) * half] = 0
-    deq = ref.E2M1[codes.long()] * torch.pow(
-        2.0, sc[:, :, : k // 32].float() - 127
-    ).repeat_interleave(32, -1)
-    packed = codes[..., 0::2] | (codes[..., 1::2] << 4)
-    return (
-        shuffle_data(packed),
-        shuffle_scale(sc.view(experts * rows, cols)).view(experts, rows, cols),
-        deq,
-    )
-
-
 def _routed_inputs(gen, rows, picks):
     """`x` and a router gate whose top-k of row `b` is `picks[b]`: each
     expert has a near-orthogonal direction `u_e`; a row is the sum of its
@@ -1418,27 +1408,31 @@ def _skewed_picks(rows, gen):
 
 
 @pytest.mark.parametrize(
-    "rows, routing, codec",
-    [
-        (32, "random", "bf16"),
-        (128, "random", "bf16"),
-        (32, "hot", "bf16"),
-        (128, "skewed", "bf16"),
-        (128, "random", "int4"),
-        (192, "hot", "bf16"),
-        (192, "skewed", "bf16"),
-    ]
-    + [(w, "random", c) for w in (129, 136, 160, 192) for c in CODECS]
-    + [(w, "random", c) for w in SMALL for c in CODECS]
-    + [(w, "hot", "bf16") for w in (1, 4, 12)],
+    "tp, rows, routing, codec",
+    tp_cases(
+        [
+            (32, "random", "bf16"),
+            (128, "random", "bf16"),
+            (32, "hot", "bf16"),
+            (128, "skewed", "bf16"),
+            (128, "random", "int4"),
+            (192, "hot", "bf16"),
+            (192, "skewed", "bf16"),
+        ]
+        + [(w, "random", c) for w in (129, 136, 160, 192) for c in CODECS]
+        + [(w, "random", c) for w in SMALL for c in CODECS]
+        + [(w, "hot", "bf16") for w in (1, 4, 12)],
+        [(32, "hot", "bf16"), (64, "skewed", "bf16")],
+    ),
 )
 @SETTINGS
-def test_moe(harness, setting, rows, routing, codec):
+def test_moe(harness, setting, tp, rows, routing, codec):
     """Routing (as sets: bf16 logits tie at the top-k boundary) and weights,
     then the rows whose routing agrees against the reference's MXFP4
     activations; at most a few rows may route differently. Narrow `hot`
-    (every row on the same experts) and `skewed` routings run split units
-    as intermediate halves; 192 hot rows fill over half a grid, so do not."""
+    (every row on the same experts) and `skewed` (from 128 rows) routings run
+    split units as intermediate halves; 192 hot rows fill over half a grid, so
+    do not."""
     from sgl_amd_mono.qwen38_flash_next.decode.wide.layout import (
         E_ALL,
         EXPERTS,
@@ -1449,7 +1443,7 @@ def test_moe(harness, setting, rows, routing, codec):
     )
     from sgl_amd_mono.qwen38_flash_next.decode.wide.stages import moe
 
-    sh = shard(2)
+    sh = shard(tp)
     gen = torch.Generator().manual_seed(3)
     if routing == "random":
         x = torch.randn(rows, HIDDEN, generator=gen).to(torch.bfloat16)
@@ -1459,8 +1453,8 @@ def test_moe(harness, setting, rows, routing, codec):
     else:
         x, w_gate = _routed_inputs(gen, rows, _skewed_picks(rows, gen))
     rip = RIP[sh.TP]
-    w13, w13s, w13d = _expert_weights(gen, E_ALL, 2 * rip, HIDDEN, sh.RI, HIDDEN)
-    w2, w2s, w2d = _expert_weights(gen, E_ALL, HIDDEN, rip, HIDDEN, sh.RI)
+    w13, w13s, w13d = _lazy_expert_weights(gen, E_ALL, 2 * rip, HIDDEN, sh.RI, HIDDEN)
+    w2, w2s, w2d = _lazy_expert_weights(gen, E_ALL, HIDDEN, rip, HIDDEN, sh.RI)
     y_r, ids_r, ws_r = ref.moe(x, w_gate, w13d, w2d, EXPERTS, TOPK, sh.RI, rip)
 
     d = {
@@ -1516,7 +1510,7 @@ def test_moe(harness, setting, rows, routing, codec):
     assert marked == _split_assignments(ids)
     if routing == "random" and rows >= 32:
         assert marked == 0
-    if routing == "skewed":
+    if routing == "skewed" and rows >= 128:  # below, its units are whole
         assert marked > 0
     if routing == "hot":
         assert marked == (0 if rows == 192 else rows * SLOTS)
@@ -1539,7 +1533,10 @@ class _LazyDequant:
 
 
 def _lazy_expert_weights(gen, experts, rows, k, rows_real, k_real):
-    """`_expert_weights` with the dequantized copy made per expert on use."""
+    """MXFP4 experts [experts, rows, k] in AITER's shuffled layouts, zero past
+    `rows_real` rows of each half (`rows` covers two) and past `k_real`:
+    (data, scales [experts, rows, pad8(k / 32)], dequantized f32 per expert on
+    use)."""
     codes = torch.randint(0, 16, (experts, rows, k), generator=gen, dtype=torch.uint8)
     codes[:, :, k_real:] = 0
     cols = (k // 32 + 7) // 8 * 8
@@ -1560,42 +1557,57 @@ def _lazy_expert_weights(gen, experts, rows, k, rows_real, k_real):
 
 @pytest.fixture(scope="module")
 def small_moe_weights():
+    """`weights(tp)`: the experts at `tp` on the device, with their
+    dequantized references, built on first use."""
     from sgl_amd_mono.qwen38_flash_next.decode.wide.layout import (
         E_ALL,
         HIDDEN,
         shard,
     )
 
-    sh = shard(2)
-    rip = RIP[sh.TP]
-    gen = torch.Generator().manual_seed(5)
-    w13, w13s, w13d = _lazy_expert_weights(gen, E_ALL, 2 * rip, HIDDEN, sh.RI, HIDDEN)
-    w2, w2s, w2d = _lazy_expert_weights(gen, E_ALL, HIDDEN, rip, HIDDEN, sh.RI)
-    dev = {n: v.cuda() for n, v in dict(w13=w13, w13s=w13s, w2=w2, w2s=w2s).items()}
-    return dev, w13d, w2d
+    built = {}
+
+    def weights(tp):
+        if tp not in built:
+            sh, rip = shard(tp), RIP[tp]
+            gen = torch.Generator().manual_seed(5)
+            w13, w13s, w13d = _lazy_expert_weights(
+                gen, E_ALL, 2 * rip, HIDDEN, sh.RI, HIDDEN
+            )
+            w2, w2s, w2d = _lazy_expert_weights(gen, E_ALL, HIDDEN, rip, HIDDEN, sh.RI)
+            dev = {
+                n: v.cuda() for n, v in dict(w13=w13, w13s=w13s, w2=w2, w2s=w2s).items()
+            }
+            built[tp] = dev, w13d, w2d
+        return built[tp]
+
+    return weights
 
 
 @pytest.mark.parametrize(
-    "rows, routing, codec",
-    [
-        (1, "picked", "bf16"),
-        (2, "picked", "bf16"),
-        (3, "picked", "bf16"),
-        (4, "picked", "bf16"),
-        (5, "picked", "bf16"),
-        (7, "shared", "bf16"),
-        (8, "picked", "bf16"),
-        (8, "random", "bf16"),
-        (8, "hot", "bf16"),
-        (8, "shared", "bf16"),
-        (8, "inactive", "bf16"),
-        (8, "picked", "int4"),
-        (12, "picked", "bf16"),
-        (12, "inactive", "bf16"),
-    ],
+    "tp, rows, routing, codec",
+    tp_cases(
+        [
+            (1, "picked", "bf16"),
+            (2, "picked", "bf16"),
+            (3, "picked", "bf16"),
+            (4, "picked", "bf16"),
+            (5, "picked", "bf16"),
+            (7, "shared", "bf16"),
+            (8, "picked", "bf16"),
+            (8, "random", "bf16"),
+            (8, "hot", "bf16"),
+            (8, "shared", "bf16"),
+            (8, "inactive", "bf16"),
+            (8, "picked", "int4"),
+            (12, "picked", "bf16"),
+            (12, "inactive", "bf16"),
+        ],
+        [(1, "picked", "bf16"), (12, "picked", "bf16")],
+    ),
 )
 @SETTINGS
-def test_moe_small(harness, small_moe_weights, setting, rows, routing, codec):
+def test_moe_small(harness, small_moe_weights, setting, tp, rows, routing, codec):
     """The small-batch MoE path (rows <= `moe.SMALL_MAX`: GEMV router, local
     routing, gate/up pieces, down by output owners into the exchange) against
     the reference, as `test_moe`. `picked`: every row its own 10 experts
@@ -1613,9 +1625,9 @@ def test_moe_small(harness, small_moe_weights, setting, rows, routing, codec):
     )
     from sgl_amd_mono.qwen38_flash_next.decode.wide.stages import moe
 
-    sh = shard(2)
+    sh = shard(tp)
     assert moe.small(rows)
-    dev, w13d, w2d = small_moe_weights
+    dev, w13d, w2d = small_moe_weights(tp)
     gen = torch.Generator().manual_seed(rows)
     idle = 3 if routing == "inactive" else 0
     if routing == "random":
@@ -1775,9 +1787,11 @@ def _qsa_proj_kernel(setting, sh, rows):
     return launch
 
 
-@pytest.mark.parametrize("rows", [1, 4, 8, 16, 128, 136, 192])
+@pytest.mark.parametrize(
+    "tp, rows", tp_cases([1, 4, 8, 16, 128, 136, 192], (1, 16, 64))
+)
 @SETTINGS
-def test_qsa_proj(harness, setting, rows):
+def test_qsa_proj(harness, setting, tp, rows):
     """qsa_front's projection phase: `x @ W_qkv.T` and `x @ W_ix.T` (bf16
     weights in vLLM's row-major layout), f32 accumulation of exact bf16
     products rounded to bf16 once, against float64 and against torch's bf16
@@ -1786,7 +1800,7 @@ def test_qsa_proj(harness, setting, rows):
     from sgl_amd_mono.qwen38_flash_next.decode.wide.layout import HIDDEN, shard
     from sgl_amd_mono.qwen38_flash_next.decode.wide.stages import qsa
 
-    sh = shard(2)
+    sh = shard(tp)
     gen = torch.Generator().manual_seed(rows)
     x = torch.randn(rows, HIDDEN, generator=gen).to(torch.bfloat16)
     w_qkv = (torch.randn(sh.QKV, HIDDEN, generator=gen) * 0.05).to(torch.bfloat16)

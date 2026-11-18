@@ -41,7 +41,9 @@ from sgl_amd_mono.qwen38_flash_next.decode.wide import layout as L
 
 logger = logging.getLogger(__name__)
 
-TP_SIZES = L.TPS
+# the TP sizes the spec routes here (the kernels are built for ``L.TPS``); TP1 runs
+# the NEXTN verify path
+TP_SIZES = (2,)
 # SGLang's decode CUDA graph capture sizes without speculative decoding up to
 # MAX_TOKENS (``generate_decode_cuda_graph_batch_sizes``), which the binding makes
 # the capture sizes up to the server's largest (``covered_capture_sizes``)

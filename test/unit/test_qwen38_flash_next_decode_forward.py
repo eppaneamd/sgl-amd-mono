@@ -20,8 +20,10 @@ from sgl_amd_mono.qwen38_flash_next.decode import check, launcher
 from sgl_amd_mono.qwen38_flash_next.decode import spec as D
 from sgl_amd_mono.qwen38_flash_next.decode.weights import Layer
 from sgl_amd_mono.qwen38_flash_next.decode.wide import layer as K
+from sgl_amd_mono.qwen38_flash_next.decode.wide import layout as L
 from sgl_amd_mono.qwen38_flash_next.decode.wide.abi import PEER_HEAD
 from sgl_amd_mono.qwen38_flash_next.decode.wide.common.grid import SLOT_WORDS
+from sgl_amd_mono.qwen38_flash_next.decode.wide.stages import exchange
 
 H = 8  # the embedding width the stand-in model uses
 ROWS = 2
@@ -52,11 +54,11 @@ def _layers(kinds=KINDS, eps=1e-6):
     ]
 
 
-def _launcher(widths=(1, 2), kinds=KINDS, rank=0, deadline_s=30.0):
+def _launcher(widths=(1, 2), kinds=KINDS, rank=0, deadline_s=30.0, tp=2):
     return launcher.Launcher(
         _layers(kinds),
         widths,
-        tp=2,
+        tp=tp,
         rank=rank,
         group=None,
         device=torch.device("cpu"),
@@ -124,6 +126,19 @@ def test_the_codec_and_the_fault_injection_reach_the_builds(monkeypatch):
         assert la.codec == "int4"
         for k in la.all_keys():
             assert k.allreduce == "int4" and (k.fault_site, k.fault_after) == fault
+
+
+def test_the_tp1_launcher_exchanges_through_its_own_mailbox(monkeypatch):
+    """At TP1 the exchange is the rank's own mailbox, its lines exact bf16
+    whatever QuickReduce is asked for; the buffers have TP1's widths."""
+    monkeypatch.setenv("ROCM_QUICK_REDUCE_QUANTIZATION", "INT4")
+    la = _launcher(widths=(1, 64), tp=1)
+    assert la.codec == "bf16"
+    assert {(k.tp, k.allreduce) for k in la.all_keys()} == {(1, "bf16")}
+    assert la.peers.nbytes == PEER_HEAD + exchange.mailbox_bytes(1)
+    assert la.peer_table.tolist() == [BASES[0] + PEER_HEAD, 0, 0, 0]
+    assert la.scratch.numel() == K.scratch_bytes(L.shard(1), 64)
+    assert la.qkv.shape == (64, 13312) and la.ixqk.shape == (64, 640)
 
 
 def test_an_odd_launch_count_is_refused():
