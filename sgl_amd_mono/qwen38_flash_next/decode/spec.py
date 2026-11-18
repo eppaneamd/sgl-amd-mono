@@ -38,7 +38,6 @@ import torch
 from sgl_amd_mono.qwen38_flash_next.decode import decode_widths
 from sgl_amd_mono.qwen38_flash_next.decode.weights import is_gdn, moe_rip, scale_cols
 from sgl_amd_mono.qwen38_flash_next.decode.wide import layout as L
-from sgl_amd_mono.qwen38_flash_next.decode.wide.stages import qsa as qsa_
 
 logger = logging.getLogger(__name__)
 
@@ -362,6 +361,10 @@ def _gdn_reasons(reasons: list[str], where: str, attn) -> None:
 
 
 def _qsa_reasons(reasons: list[str], where: str, layer) -> None:
+    # the stage imports FlyDSL, which the config refusals check for: imported
+    # here, after them
+    from sgl_amd_mono.qwen38_flash_next.decode.wide.stages import qsa as qsa_
+
     _linear(reasons, f"{where} o_proj", _get(layer, "o_proj"), (L.HIDDEN, L.QSA_CORE))
     # qsa_front projects x through both, row-major [rows, HIDDEN]
     _linear(reasons, f"{where} qkv_proj", _get(layer, "qkv_proj"), (qsa_.QKV, L.HIDDEN))

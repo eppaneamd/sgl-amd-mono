@@ -5,6 +5,10 @@ calls it needs. SGLang checks the declared requirements and features, the same w
 for every spec."""
 
 import importlib.util
+import json
+import os
+import subprocess
+import sys
 from types import SimpleNamespace as NS
 
 import pytest
@@ -167,8 +171,38 @@ def test_config_reasons_refuse(
 
 
 def test_config_reasons_need_flydsl(flydsl, clean_env):
-    flydsl(False)
-    assert S.SPEC.config_disable_reasons(server_args(), hf_config()) == ["needs FlyDSL"]
+    # Without FlyDSL the spec still imports, and each TP size's path refuses. A
+    # child process: this one has imported FlyDSL, and None in sys.modules is a
+    # module that neither imports nor is found
+    code = (
+        "import json, sys\n"
+        "sys.modules['flydsl'] = None\n"
+        "from qwen38_flash_next_decode_fakes import hf_config, server_args\n"
+        "from sgl_amd_mono.qwen38_flash_next.spec import SPEC\n"
+        "print(json.dumps([SPEC.config_disable_reasons(server_args(**a), hf_config())"
+        " for a in json.loads(sys.argv[1])]))\n"
+    )
+    tp1 = {
+        "tp_size": 1,
+        "speculative_eagle_topk": None,
+        "speculative_num_steps": None,
+        "speculative_num_draft_tokens": None,
+        "context_length": None,
+    }
+    proc = subprocess.run(
+        [sys.executable, "-c", code, json.dumps([{}, tp1])],
+        env={**os.environ, "PYTHONPATH": os.pathsep.join(sys.path)},
+        capture_output=True,
+        text=True,
+    )
+    assert proc.returncode == 0, proc.stderr[-4000:]
+    tp2_reasons, tp1_reasons = json.loads(proc.stdout.splitlines()[-1])
+    assert tp2_reasons == ["needs FlyDSL"]
+    # TP1's other reasons (its NEXTN arguments, ...) with FlyDSL found, then it
+    assert tp1_reasons == [
+        *S.SPEC.config_disable_reasons(server_args(**tp1), hf_config()),
+        "needs FlyDSL",
+    ]
 
 
 def test_the_tp_size_selects_the_path(flydsl, clean_env):
