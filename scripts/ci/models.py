@@ -362,7 +362,9 @@ MODELS = {
             "test/kernels/test_qwen38_flash_next_wide_exchange.py",
         ],
         "e2e_tests": ["test/e2e/test_qwen38_flash_next_decode_server.py"],
-        "microbench": [],
+        "microbench": [
+            "torchrun --nproc-per-node 2 test/kernels/qwen38_flash_next/time_layers.py --kind model --rows 1,16,64,192"
+        ],
         "evals": TEXT_EVALS,
         # decode steps of 1 to 192 rows
         "concurrency": [1, 4, 16, 64, 128, 192],
