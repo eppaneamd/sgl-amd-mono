@@ -84,8 +84,9 @@ def is_gdn(layer) -> bool:
     return getattr(layer, "linear_attn", None) is not None
 
 
-def moe_rip(w13: torch.Tensor, w2: torch.Tensor) -> int:
-    """The padded intermediate RIP the MXFP4 expert weights hold, from their shapes.
+def moe_rip(w13: torch.Tensor, w2: torch.Tensor, ri: int) -> int:
+    """The padded intermediate RIP the MXFP4 expert weights hold, from their shapes,
+    for a rank's intermediate RI (``layout.Shard.RI``).
 
     w13 [E', 2 RIP, H / 2] holds gate rows [0, RI) and up rows [RIP, RIP + RI); w2
     [E', H, RIP / 2]; one byte per two FP4 values. SGLang pads the packed bytes to
@@ -103,8 +104,8 @@ def moe_rip(w13: torch.Tensor, w2: torch.Tensor) -> int:
         raise ValueError(f"w13 pads the intermediate to {rip}, w2 to {w2.shape[2] * 2}")
     if w13.shape[2] * 2 != L.HIDDEN or w2.shape[1] != L.HIDDEN:
         raise ValueError(f"expert weights are not {L.HIDDEN} wide: {tuple(w13.shape)}")
-    if rip < L.RI or rip % 128:
-        raise ValueError(f"intermediate padded to {rip}: {L.RI} in steps of 128")
+    if rip < ri or rip % 128:
+        raise ValueError(f"intermediate padded to {rip}: {ri} in steps of 128")
     return rip
 
 

@@ -133,7 +133,7 @@ def test_an_odd_launch_count_is_refused():
 
 def test_the_static_arguments_are_the_abi():
     la = _launcher(widths=(1, 16))
-    assert la.scratch.numel() == K.scratch_bytes(16) and not la.scratch.any()
+    assert la.scratch.numel() == K.scratch_bytes(la.shard, 16) and not la.scratch.any()
     assert la.x.shape == (16, 2560) and la.qkv.shape == (16, 6656)
     assert la.ixqk.shape == (16, 640)
     assert {w: t.dtype for w, t in la.st_idx.items()} == {

@@ -69,6 +69,7 @@ class Launcher:
             from sgl_amd_mono.common.peer import PeerBuffer as make_peers
         self.layers, self.widths = layers, tuple(sorted(widths))
         self.tp, self.rank, self.rip, self.deadline_s = tp, rank, rip, deadline_s
+        self.shard = L.shard(tp)
         self.launches = sum(1 if ly.kind == "gdn" else 2 for ly in layers)
         if self.launches % 2:
             raise ValueError(
@@ -79,11 +80,11 @@ class Launcher:
         top = max(self.widths)
         # zeroed: the MoE's split-unit marks are compared against step tags
         self.scratch = torch.zeros(
-            K.scratch_bytes(top), dtype=torch.uint8, device=device
+            K.scratch_bytes(self.shard, top), dtype=torch.uint8, device=device
         )
         self.x = torch.empty(top, L.HIDDEN, dtype=torch.bfloat16, device=device)
         # qsa_front's projections of x: qkv_proj's and index_qk_proj's outputs
-        self.qkv = torch.empty(top, qsa_.QKV, dtype=torch.bfloat16, device=device)
+        self.qkv = torch.empty(top, self.shard.QKV, dtype=torch.bfloat16, device=device)
         self.ixqk = torch.empty(top, qsa_.IX, dtype=torch.bfloat16, device=device)
         # the step's GDN slots as int32, per width (a graph records the copy)
         self.st_idx = {

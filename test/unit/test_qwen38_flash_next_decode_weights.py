@@ -100,7 +100,7 @@ def test_mxfp4_dequant_reads_the_copy():
 def test_the_gdn_copies_need_no_scale_padding():
     """Both GDN linears' K / 32 is a multiple of 8, so the copy's [N, K / 32] scales
     are the kernels' padded scale rows (``Fp4Weights.scale_cols``)."""
-    for k in (L.HIDDEN, L.VALUE_DIM):
+    for k in (L.HIDDEN, *(L.shard(tp).VALUE_DIM for tp in L.TPS)):
         assert W.scale_cols(k) == k // 32
 
 
@@ -110,18 +110,18 @@ def test_the_gdn_copies_need_no_scale_padding():
 def test_sglang_pads_the_experts_to_512():
     from sglang.srt.layers.moe.utils import get_moe_weight_sizes
 
-    w13_rows, w2_bytes, padded = get_moe_weight_sizes(L.RI, True, True, True)
+    w13_rows, w2_bytes, padded = get_moe_weight_sizes(L.shard(2).RI, True, True, True)
     assert (w13_rows, w2_bytes, padded) == (1024, 256, True)
     w13 = meta(513, w13_rows, 1280, dtype=torch.uint8)
     w2 = meta(513, 2560, w2_bytes, dtype=torch.uint8)
-    assert W.moe_rip(w13, w2) == 512
+    assert W.moe_rip(w13, w2, 320) == 512
     K.LayerBuild(kind="gdn", tokens=1, tp=2, rip=512)
 
 
 def test_moe_rip_at_the_kernels_own_padding():
     w13 = meta(513, 768, 1280, dtype=torch.uint8)
     w2 = meta(513, 2560, 192, dtype=torch.uint8)
-    assert W.moe_rip(w13, w2) == 384
+    assert W.moe_rip(w13, w2, 320) == 384
 
 
 @pytest.mark.parametrize(
@@ -136,7 +136,7 @@ def test_moe_rip_at_the_kernels_own_padding():
 )
 def test_moe_rip_rejects(w13_shape, w2_shape, dtype, match):
     with pytest.raises(ValueError, match=match):
-        W.moe_rip(meta(*w13_shape, dtype=dtype), meta(*w2_shape, dtype=dtype))
+        W.moe_rip(meta(*w13_shape, dtype=dtype), meta(*w2_shape, dtype=dtype), 320)
 
 
 def test_fuse_hc_down_inject():

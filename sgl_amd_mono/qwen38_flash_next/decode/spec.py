@@ -41,7 +41,7 @@ from sgl_amd_mono.qwen38_flash_next.decode.wide import layout as L
 
 logger = logging.getLogger(__name__)
 
-TP_SIZES = (L.TP,)
+TP_SIZES = L.TPS
 # SGLang's decode CUDA graph capture sizes without speculative decoding up to
 # MAX_TOKENS (``generate_decode_cuda_graph_batch_sizes``), which the binding makes
 # the capture sizes up to the server's largest (``covered_capture_sizes``)
@@ -304,36 +304,36 @@ def _linear(reasons, where, linear, shape) -> None:
         reasons.append(f"{where} has a bias")
 
 
-def _gdn_reasons(reasons: list[str], where: str, attn) -> None:
+def _gdn_reasons(reasons: list[str], where: str, attn, sh) -> None:
     for name, shape in (
-        ("in_proj_qkvz", (L.QKVZ, L.HIDDEN)),
-        ("in_proj_ba", (L.BA, L.HIDDEN)),
-        ("out_proj", (L.HIDDEN, L.VALUE_DIM)),
+        ("in_proj_qkvz", (sh.QKVZ, L.HIDDEN)),
+        ("in_proj_ba", (sh.BA, L.HIDDEN)),
+        ("out_proj", (L.HIDDEN, sh.VALUE_DIM)),
     ):
         _linear(reasons, f"{where} {name}", _get(attn, name), shape)
-    _expect(reasons, f"{where} A_log", _get(attn, "A_log"), (L.NV,), torch.float32)
+    _expect(reasons, f"{where} A_log", _get(attn, "A_log"), (sh.NV,), torch.float32)
     dt_bias = _get(attn, "dt_bias")  # copied to bf16 if held otherwise
     if not (
         isinstance(dt_bias, torch.Tensor)
         and dt_bias.is_floating_point()
-        and tuple(dt_bias.shape) == (L.NV,)
+        and tuple(dt_bias.shape) == (sh.NV,)
     ):
-        reasons.append(f"{where} dt_bias: {_brief(dt_bias)}, expected ({L.NV},) float")
+        reasons.append(f"{where} dt_bias: {_brief(dt_bias)}, expected ({sh.NV},) float")
     _expect(reasons, f"{where} norm", _get(attn, "norm.weight"), (L.GDN_DV,))
     conv = _get(attn, "conv1d.weight")
     if not (
         isinstance(conv, torch.Tensor)
         and conv.dtype == torch.bfloat16
-        and conv.numel() == L.CONV_DIM * L.CONV_TAPS
+        and conv.numel() == sh.CONV_DIM * L.CONV_TAPS
         and conv.is_contiguous()
     ):
         reasons.append(
-            f"{where} conv1d: {_brief(conv)}, expected {L.CONV_DIM} x {L.CONV_TAPS} "
+            f"{where} conv1d: {_brief(conv)}, expected {sh.CONV_DIM} x {L.CONV_TAPS} "
             "bf16"
         )
     sizes = _get(attn, "in_proj_qkvz.output_sizes")
-    split = [L.KEY_DIM, L.KEY_DIM, L.VALUE_DIM, L.VALUE_DIM]
-    if sizes is not None and [x // L.TP for x in sizes] != split:
+    split = [sh.KEY_DIM, sh.KEY_DIM, sh.VALUE_DIM, sh.VALUE_DIM]
+    if sizes is not None and [x // sh.TP for x in sizes] != split:
         reasons.append(
             f"{where} in_proj_qkvz output_sizes {sizes}, expected [q, k, v, z]"
         )
@@ -360,14 +360,14 @@ def _gdn_reasons(reasons: list[str], where: str, attn) -> None:
         )
 
 
-def _qsa_reasons(reasons: list[str], where: str, layer) -> None:
+def _qsa_reasons(reasons: list[str], where: str, layer, sh) -> None:
     # the stage imports FlyDSL, which the config refusals check for: imported
     # here, after them
     from sgl_amd_mono.qwen38_flash_next.decode.wide.stages import qsa as qsa_
 
-    _linear(reasons, f"{where} o_proj", _get(layer, "o_proj"), (L.HIDDEN, L.QSA_CORE))
+    _linear(reasons, f"{where} o_proj", _get(layer, "o_proj"), (L.HIDDEN, sh.QSA_CORE))
     # qsa_front projects x through both, row-major [rows, HIDDEN]
-    _linear(reasons, f"{where} qkv_proj", _get(layer, "qkv_proj"), (qsa_.QKV, L.HIDDEN))
+    _linear(reasons, f"{where} qkv_proj", _get(layer, "qkv_proj"), (sh.QKV, L.HIDDEN))
     _linear(
         reasons,
         f"{where} index_qk_proj",
@@ -399,7 +399,7 @@ def _hc_eps(reasons: list[str], where: str, layer) -> list[float]:
     return eps
 
 
-def _moe_reasons(reasons: list[str], where: str, mlp):
+def _moe_reasons(reasons: list[str], where: str, mlp, ri: int):
     """The experts' padded intermediate, or None (a reason recorded)."""
     _expect(reasons, f"{where} router", _get(mlp, "gate.weight"), (L.EXPERTS, L.HIDDEN))
     _expect(
@@ -417,7 +417,7 @@ def _moe_reasons(reasons: list[str], where: str, mlp):
         reasons.append(f"{where} experts: missing w13_weight / w2_weight")
         return None
     try:
-        rip = moe_rip(w13, w2)
+        rip = moe_rip(w13, w2, ri)
     except ValueError as e:
         reasons.append(f"{where} experts: {e}")
         return None
@@ -445,8 +445,9 @@ def _moe_reasons(reasons: list[str], where: str, mlp):
     return rip
 
 
-def layout_reasons(model) -> list[str]:
-    """What the kernels refuse in the loaded model (one TP2 rank's modules)."""
+def layout_reasons(model, tp: int) -> list[str]:
+    """What the kernels refuse in the loaded model (one TP rank's modules)."""
+    sh = L.shard(tp)
     reasons = []
     layers = list(model.model.layers)
     kinds = ["gdn" if is_gdn(x) else "qsa" for x in layers]
@@ -459,11 +460,11 @@ def layout_reasons(model) -> list[str]:
     for i, layer in enumerate(layers):
         where = f"layer {i}"
         if is_gdn(layer):
-            _gdn_reasons(reasons, where, layer.linear_attn)
+            _gdn_reasons(reasons, where, layer.linear_attn, sh)
         else:
-            _qsa_reasons(reasons, where, layer)
+            _qsa_reasons(reasons, where, layer, sh)
         eps.update(_hc_eps(reasons, where, layer))
-        rip = _moe_reasons(reasons, where, layer.mlp)
+        rip = _moe_reasons(reasons, where, layer.mlp, sh.RI)
         if rip is not None:
             rips.add(rip)
     if len(rips) > 1:
@@ -517,25 +518,28 @@ def backend_reasons() -> list[str]:
 
 
 def model_disable_reasons(model, hf_config, copies: dict) -> list[str]:
-    return layout_reasons(model) + backend_reasons()
+    from sglang.srt.runtime_context import get_parallel
+
+    return layout_reasons(model, get_parallel().tp_size) + backend_reasons()
 
 
-def gdn_state_reasons(conv: torch.Tensor, ssm: torch.Tensor) -> list[str]:
+def gdn_state_reasons(conv: torch.Tensor, ssm: torch.Tensor, tp: int) -> list[str]:
     """The GDN states the kernels update in place: the conv state [slots,
     CONV_DIM, 3] bf16, a slot's rows dense (``conv_dim_first``: a row's taps read
     8 bytes at a time, so a slot's pitch is a multiple of 4 elements and the base
     8-byte aligned), and the recurrent state [slots, NV, DV, DK] f32, a slot
     dense."""
+    sh = L.shard(tp)
     reasons = []
     taps = L.CONV_TAPS - 1
     if (
         conv.dtype != torch.bfloat16
         or conv.dim() != 3
-        or tuple(conv.shape[1:]) != (L.CONV_DIM, taps)
+        or tuple(conv.shape[1:]) != (sh.CONV_DIM, taps)
     ):
         reasons.append(
             f"conv state {tuple(conv.shape)} {conv.dtype}, expected "
-            f"[slots, {L.CONV_DIM}, {taps}] bfloat16"
+            f"[slots, {sh.CONV_DIM}, {taps}] bfloat16"
         )
     elif (
         tuple(conv.stride()[1:]) != (taps, 1)
@@ -544,17 +548,17 @@ def gdn_state_reasons(conv: torch.Tensor, ssm: torch.Tensor) -> list[str]:
     ):
         reasons.append(
             f"conv state strides {conv.stride()} at {conv.data_ptr():#x}: a slot's "
-            f"[{L.CONV_DIM}, {taps}] dense, its pitch a multiple of 4 elements and "
+            f"[{sh.CONV_DIM}, {taps}] dense, its pitch a multiple of 4 elements and "
             "the base 8-byte aligned expected"
         )
     if (
         ssm.dtype != torch.float32
         or ssm.dim() != 4
-        or tuple(ssm.shape[1:]) != (L.NV, L.GDN_DV, L.GDN_DK)
+        or tuple(ssm.shape[1:]) != (sh.NV, L.GDN_DV, L.GDN_DK)
     ):
         reasons.append(
             f"recurrent state {tuple(ssm.shape)} {ssm.dtype}, expected "
-            f"[slots, {L.NV}, {L.GDN_DV}, {L.GDN_DK}] float32"
+            f"[slots, {sh.NV}, {L.GDN_DV}, {L.GDN_DK}] float32"
         )
     elif not ssm[0].is_contiguous():
         reasons.append(f"recurrent state slot not dense: strides {ssm.stride()}")
@@ -650,7 +654,7 @@ class _Built:
         cache = lab.state_layer_cache(i)
         conv, ssm = cache.conv[0], cache.temporal
         if not self.la.bound(i, conv, ssm):
-            why = gdn_state_reasons(conv, ssm)
+            why = gdn_state_reasons(conv, ssm, self.la.tp)
             if why:
                 raise RuntimeError(
                     f"Qwen3.8-Flash-Next monokernel: layer {i}: " + "; ".join(why)
@@ -773,7 +777,7 @@ def build(model, hf_config, ctx) -> _Built:
         rank,
         group,
         experts.w13_weight.device,
-        moe_rip(experts.w13_weight, experts.w2_weight),
+        moe_rip(experts.w13_weight, experts.w2_weight, L.shard(tp).RI),
         ctx.deadline_s,
     )
     # the launch state is zero (the peer buffer from its allocation) before any

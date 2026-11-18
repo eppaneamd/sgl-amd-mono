@@ -272,12 +272,12 @@ def test_model_reasons_need_the_backend_s_gdn_state_read(tp2, monkeypatch):
 
 @pytest.mark.parametrize("rip", [384, 512, 640])
 def test_layout_reasons_clean_at_any_padding_of_128(rip):
-    assert D.layout_reasons(fake_model(rip=rip)) == []
+    assert D.layout_reasons(fake_model(rip=rip), 2) == []
 
 
 @pytest.mark.parametrize("rip", [352, 416])
 def test_layout_reasons_padding_off_the_128_steps(rip):
-    assert D.layout_reasons(fake_model(rip=rip)) == [
+    assert D.layout_reasons(fake_model(rip=rip), 2) == [
         f"layer {i} experts: intermediate padded to {rip}: 320 in steps of 128"
         for i in range(48)
     ]
@@ -286,7 +286,7 @@ def test_layout_reasons_padding_off_the_128_steps(rip):
 def test_layout_reasons_mixed_padding():
     model = fake_model(rip=512)
     model.model.layers[5].mlp = fake_model(rip=384).model.layers[5].mlp
-    assert D.layout_reasons(model) == [
+    assert D.layout_reasons(model, 2) == [
         "the layers' experts are padded differently: [384, 512]"
     ]
 
@@ -294,7 +294,9 @@ def test_layout_reasons_mixed_padding():
 def test_layout_reasons_one_hc_epsilon():
     model = fake_model()
     model.model.layers[6].mlp_hyper_connection.hc_norm.variance_epsilon = 1e-5
-    assert D.layout_reasons(model) == ["the HC norms' epsilons differ: [1e-05, 1e-06]"]
+    assert D.layout_reasons(model, 2) == [
+        "the HC norms' epsilons differ: [1e-05, 1e-06]"
+    ]
 
 
 def test_layout_reasons_name_the_broken_tensor():
@@ -318,7 +320,7 @@ def test_layout_reasons_name_the_broken_tensor():
     layers[18].linear_attn.activation = "gelu"
     layers[19].attn_output_gate = False
     layers[23].is_qsa = False
-    assert D.layout_reasons(model) == [
+    assert D.layout_reasons(model, 2) == [
         "layer 0 attn_hyper_connection inject: (10240, 4) torch.bfloat16, expected "
         "(4, 10240) torch.bfloat16",
         "layer 3 qkv_proj: (6144, 2560) torch.bfloat16, expected (6656, 2560) "
@@ -347,7 +349,9 @@ def test_layout_reasons_name_the_broken_tensor():
 def test_layout_reasons_layer_mix():
     model = fake_model(rip=384)
     model.model.layers[3] = model.model.layers[0]
-    assert D.layout_reasons(model) == ["37 GDN and 11 QSA layers, expected 36 and 12"]
+    assert D.layout_reasons(model, 2) == [
+        "37 GDN and 11 QSA layers, expected 36 and 12"
+    ]
 
 
 def test_model_reasons_refuse_the_padding_off_the_steps(tp2):
@@ -366,9 +370,9 @@ def test_gdn_state_reasons_take_sglang_s_pool():
     conv = _pool()
     ssm = torch.zeros(9, 24, 128, 128)
     assert conv.stride() == (15360, 3, 1)
-    assert D.gdn_state_reasons(conv, ssm) == []
+    assert D.gdn_state_reasons(conv, ssm, 2) == []
     # a slot pitch that is a multiple of 4 elements past the slot's rows
-    assert D.gdn_state_reasons(_pool(pitch=15364), ssm) == []
+    assert D.gdn_state_reasons(_pool(pitch=15364), ssm, 2) == []
 
 
 @pytest.mark.parametrize(
@@ -383,15 +387,17 @@ def test_gdn_state_reasons_take_sglang_s_pool():
     ],
 )  # fmt: skip
 def test_gdn_state_reasons_refuse_a_conv_state(conv, match):
-    reasons = D.gdn_state_reasons(conv(), torch.zeros(9, 24, 128, 128))
+    reasons = D.gdn_state_reasons(conv(), torch.zeros(9, 24, 128, 128), 2)
     assert len(reasons) == 1 and match in reasons[0], reasons
 
 
 def test_gdn_state_reasons_refuse_a_recurrent_state():
     conv = _pool()
-    bf16 = D.gdn_state_reasons(conv, torch.zeros(9, 24, 128, 128, dtype=torch.bfloat16))
+    bf16 = D.gdn_state_reasons(
+        conv, torch.zeros(9, 24, 128, 128, dtype=torch.bfloat16), 2
+    )
     assert len(bf16) == 1 and bf16[0].startswith("recurrent state (9, 24, 128, 128)")
     sparse = torch.zeros(3, 24, 128, 256)[..., :128]
-    assert D.gdn_state_reasons(conv, sparse) == [
+    assert D.gdn_state_reasons(conv, sparse, 2) == [
         f"recurrent state slot not dense: strides {sparse.stride()}"
     ]
