@@ -37,8 +37,10 @@ run SGLang's forward.
   experts with the shared expert fused as expert 512, padded to a multiple of 128 intermediate rows;
 - the GDN states as SGLang keeps them: a bf16 conv state `[slots, CONV_DIM, 3]` and an f32 recurrent state
   `[slots, NV, DV, DK]`, a slot dense, on the triton GDN decode backend; pad rows (slot <= 0) write none;
-- the TP all-reduces follow SGLang's quick all-reduce setting: `ROCM_QUICK_REDUCE_QUANTIZATION=INT4` sends
-  QuickReduce's INT4 codec lines, anything else exact bf16 sums in rank order (`decode.allreduce_codec`).
+- the TP all-reduces send exact bf16 sums in rank order; with `ROCM_QUICK_REDUCE_QUANTIZATION=INT4` they send
+  QuickReduce's INT4 codec lines instead (`decode.allreduce_codec`). SGLang's own decode all-reduce stays exact at
+  these sizes (a 192-row exchange is 0.94 MiB; QuickReduce's INT4 minimum for bf16 at TP2 is 8 MiB), so INT4 makes
+  the launches' exchange lossy where SGLang's is not.
 
 ## Refusals
 

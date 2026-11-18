@@ -21,8 +21,9 @@ def decode_widths(capture_sizes) -> tuple[int, ...]:
 
 
 def allreduce_codec() -> str:
-    """The TP exchange's line codec: QuickReduce's INT4 codec when the deployment
-    asks SGLang's quick all-reduce for INT4 (``ROCM_QUICK_REDUCE_QUANTIZATION``),
-    else exact bf16 lines."""
+    """The TP exchange's line codec: exact bf16 lines, or QuickReduce's INT4 codec
+    when ``ROCM_QUICK_REDUCE_QUANTIZATION`` is INT4. SGLang's own all-reduce of a
+    decode step stays exact at these sizes (below QuickReduce's minimum), so INT4
+    is lossy here where SGLang is not."""
     level = os.environ.get("ROCM_QUICK_REDUCE_QUANTIZATION", "NONE")
     return "int4" if level == "INT4" else "bf16"

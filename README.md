@@ -254,9 +254,13 @@ SGLANG_USE_AITER=1 python -m sglang.launch_server \
   --linear-attn-backend triton \
   --moe-runner-backend aiter \
   --max-running-requests 192 \
+  --max-mamba-cache-size 960 \
   --cuda-graph-max-bs-decode 192 \
   --monokernel-backend amd
 ```
+
+`--max-mamba-cache-size 960` gives each of the 192 requests its 5 state slots (radix cache on); at the default size
+SGLang caps the running requests below 192 (at 178 with the test recipe's `--mem-fraction-static 0.85`).
 
 If the model, GPU or configuration is not supported, the server refuses to start and lists every reason.
 

@@ -1,9 +1,8 @@
 """Qwen3.8-Flash-Next (the MXFP4 checkpoint) with --monokernel-backend amd on two
-MI355X, TP2 decode, across the switch points: decode steps of 1 to 192 rows run the
-wide launches, wider ones the normal path. The startup line shows every captured
+MI355X, TP2 decode of 1 to 192 rows: the server runs at most 192 requests, so every
+decode step is one the wide launches take. The startup line shows every captured
 decode graph runs them. GSM8K and MMMU against the normal path on the same server
-arguments, with requests joining and leaving a batch that steps past 192 rows and
-back; the tokens of covered steps scored again by the normal prefill path (KL
+arguments, with requests joining and leaving batches of up to 192 rows; the tokens of covered steps scored again by the normal prefill path (KL
 consistency), the second turn of a conversation decoding from the GDN states the
 radix cache saved during the first; each layer's launches against SGLang's own layer
 under SGLANG_AMD_MONO_CHECK; and a rank stalled by SGLANG_AMD_MONO_FAULT_INJECT
@@ -49,8 +48,8 @@ MMMU_DROP = 0.05
 # decode step covered), mean KL a batch: 0.022 to 0.085 on the normal path (3 runs,
 # one server), 0.026 to 0.097 with the monokernels (6 runs, 4 servers)
 KL_BOUND = 0.12
-# 200 requests at a time: a batch steps past 192 rows as it fills, and back as it
-# drains
+# 200 requests at a time, more than the server runs: its batches fill to the
+# largest width, 192 rows
 THREADS = 200
 # Check mode: one batch a width, from 1 row to the largest
 CHECK_ROWS = (1, 4, 16, 64, 128, 192)
