@@ -45,8 +45,10 @@ WIDTHS = sorted(w for w in SPEC.devices["gfx950"].widths if w <= 192)
 # Score drops against the normal path that fail the run: bounds for gross failures
 GSM8K_DROP = 0.03
 MMMU_DROP = 0.05
-# Decode against prefill, one batch of prompts at a time (every decode step covered)
-KL_BOUND = 0.06
+# Decode against prefill, one batch of 1 to 192 LongBench-v2 prompts at a time (every
+# decode step covered), mean KL a batch: 0.022 to 0.085 on the normal path (3 runs,
+# one server), 0.026 to 0.097 with the monokernels (6 runs, 4 servers)
+KL_BOUND = 0.12
 # 200 requests at a time: a batch steps past 192 rows as it fills, and back as it
 # drains
 THREADS = 200
