@@ -28,7 +28,6 @@ from collections.abc import Iterable
 import torch
 
 from sgl_amd_mono.common import guard
-from sgl_amd_mono.qwen38_flash_next.decode import allreduce_codec
 from sgl_amd_mono.qwen38_flash_next.decode.weights import Layer
 from sgl_amd_mono.qwen38_flash_next.decode.wide import layer as K
 from sgl_amd_mono.qwen38_flash_next.decode.wide import layout as L
@@ -74,7 +73,8 @@ class Launcher:
             raise ValueError(
                 f"{self.launches} launches a step: the barrier slots need an even count"
             )
-        self.codec = allreduce_codec()
+        # exact bf16 sums in rank order, as SGLang's decode all-reduce at these sizes
+        self.codec = "bf16"
         self.fault = guard.fault_injection(rank) or NO_FAULT
         top = max(self.widths)
         # zeroed: the MoE's split-unit marks are compared against step tags

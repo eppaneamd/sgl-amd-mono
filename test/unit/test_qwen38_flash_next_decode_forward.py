@@ -116,14 +116,18 @@ def test_the_launcher_builds_in_sglang_s_setting(monkeypatch):
     assert keys == sorted(keys, key=repr)
 
 
-def test_the_codec_and_the_fault_injection_reach_the_builds(monkeypatch):
+def test_the_exchange_stays_bf16_and_the_fault_injection_reaches_the_builds(
+    monkeypatch,
+):
+    # SGLang's decode all-reduce is exact at these sizes whatever QuickReduce's
+    # setting, so the launches' exchange is too
     monkeypatch.setenv("ROCM_QUICK_REDUCE_QUANTIZATION", "INT4")
     monkeypatch.setenv("SGLANG_AMD_MONO_FAULT_INJECT", "1:2:1000")
     for rank, fault in ((0, (0, 0)), (1, (2, 1000))):
         la = _launcher(rank=rank)
-        assert la.codec == "int4"
+        assert la.codec == "bf16"
         for k in la.all_keys():
-            assert k.allreduce == "int4" and (k.fault_site, k.fault_after) == fault
+            assert k.allreduce == "bf16" and (k.fault_site, k.fault_after) == fault
 
 
 def test_an_odd_launch_count_is_refused():
