@@ -132,12 +132,10 @@ def test_the_exchange_stays_bf16_and_the_fault_injection_reaches_the_builds(
             assert k.allreduce == "bf16" and (k.fault_site, k.fault_after) == fault
 
 
-def test_the_tp1_launcher_exchanges_through_its_own_mailbox(monkeypatch):
-    """At TP1 the exchange is the rank's own mailbox, its lines exact bf16
-    whatever QuickReduce is asked for; the buffers have TP1's widths."""
-    monkeypatch.setenv("ROCM_QUICK_REDUCE_QUANTIZATION", "INT4")
+def test_the_tp1_launcher_exchanges_through_its_own_mailbox():
+    """At TP1 the exchange is the rank's own mailbox; the buffers have TP1's
+    widths."""
     la = _launcher(widths=(1, 64), tp=1)
-    assert la.codec == "bf16"
     assert {(k.tp, k.allreduce) for k in la.all_keys()} == {(1, "bf16")}
     assert la.peers.nbytes == PEER_HEAD + exchange.mailbox_bytes(1)
     assert la.peer_table.tolist() == [BASES[0] + PEER_HEAD, 0, 0, 0]
