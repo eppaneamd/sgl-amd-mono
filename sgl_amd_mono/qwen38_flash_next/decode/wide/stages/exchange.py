@@ -263,6 +263,18 @@ def _untagged(ex, seen):
     return pend
 
 
+def _peer_untagged(ex, seen):
+    """Whether a peer rank's flag of `seen` (`_flag_index`'s order) lacks the
+    tag (stop mode's later deadline, `grid.deadlines`); None at one rank."""
+    if ex.tp == 1:
+        return None
+    pend = None
+    for k, v in enumerate(seen):
+        p = (v != ex.tag) & (ex.rank != fx.Int32(k % ex.tp))
+        pend = p if pend is None else pend | p
+    return pend
+
+
 @traced
 def _wait_lines(g, ex, lines):
     idx = _flag_index(ex, lines)
@@ -292,7 +304,7 @@ def _wait_lines_stop(g, ex, lines, stall):
         pend = _untagged(ex, seen)
         polls = polls + 1
         if (polls & fx.Int32(CHECK_POLLS - 1)) == fx.Int32(0):
-            check(g, t0)
+            check(g, t0, SITE_PEER, peer=_peer_untagged(ex, seen))
     return [v - ex.tag for v in seen]
 
 

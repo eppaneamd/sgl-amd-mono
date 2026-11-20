@@ -21,10 +21,13 @@ PEER_HEAD = 256  # bytes: the output rank's flags, a word a rank
 WAIT_SECONDS = 10  # an in-kernel wait gives up after this long (vLLM's setting)
 WAIT_TICKS = WAIT_SECONDS * 100_000_000  # s_memrealtime ticks at 100 MHz
 
-# wait sites a record names
+# wait sites a record names, and in stop mode the page a stopped launch faults at
+# (`grid.check`)
 SITE_GRID = 1  # a grid barrier
 SITE_PEER = 2  # a TP exchange line
-SITE_FOLD = 3  # a split-K fold's arrival count
+SITE_FOLD = 3  # a tagged hand-off between the launch's CTAs (`stages.tagged`)
+# stop mode's page for a peer's flag seen (no record names it)
+SITE_FLAG = 4
 
 
 def health_words(ctas: int) -> int:

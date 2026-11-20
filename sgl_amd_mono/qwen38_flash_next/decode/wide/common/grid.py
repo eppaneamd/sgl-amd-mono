@@ -3,7 +3,7 @@
 # Adapted from vllm-project/vllm#65188 at 294644b81e (Apache-2.0):
 # vllm/models/qwen4_exp/amd/specialized_decode/wide/common/grid.py
 """A launch's identity and its synchronization: the grid barrier between
-phases and the split-K fold's last-arriver count, both behind a bounded wait.
+phases, behind a bounded wait, and the split-K fold's last-arriver count.
 
 Grid barrier (striped): a CTA adds one to its
 arrival stripe, one of `STRIPES` counters on separate 256-byte lines, four
@@ -23,18 +23,32 @@ its later waits, and every other CTA's, exit at once and the launch runs to
 its end. The host reads FAILED after the step.
 
 Stop mode (`Grid.stop`, SGLang's setting): a wait checks every `CHECK_POLLS`
-polls. Past its deadline it raises its rank's word in every rank's flags
-(`Grid.watch`), drains and faults the launch (`guard.stop_launch`); a set word
-in its own rank's flags faults it too, so after a timeout on one rank every
-other rank faults at its first wait for the stopped rank's data. A launch never
-runs on with words that did not come. `Grid.inject` stalls one wait for the
-fault injection (`guard.fault_injection`).
+polls. Past its deadline it raises its rank's word in every other rank's flags
+(`Grid.watch`), drains and faults the launch at its site's page
+(`guard.stop_launch`: 0x1000 a grid barrier, 0x2000 a TP exchange line, 0x3000 a
+tagged hand-off between CTAs); a peer's word set in its rank's flags faults it at
+`SITE_FLAG`'s page, 0x4000, so after a timeout on one rank every other rank
+faults at its first wait for the stopped rank's data. A launch never runs on with
+words that did not come. `Grid.inject` stalls one wait for the fault injection
+(`guard.fault_injection`).
+
+The runtime reports a queue's first fault, so the waits that give up first name
+the stall: a rank never raises its own word (its GPU would fault at the flag's
+page first), and the deadlines are staggered (`deadlines`) so that the first wait
+to give up is of the kind furthest upstream. A hand-off from this GPU (a tagged
+hand-off; an exchange line, while only this rank's lines are missing) gives up at
+the build's deadline, a grid barrier a grace later, and an exchange wait missing
+a peer's line two graces later. A stuck GPU's page then names the hand-off that
+never came (0x3000, 0x2000), or a grid barrier only when no hand-off or line of
+its own was missing (a CTA that never arrived, as when not every CTA is resident,
+or one waiting on a peer's line); a GPU waiting on a stuck peer faults at the
+flag's page.
 """
 
 from __future__ import annotations
 
 import flydsl.expr as fx
-from flydsl.expr import const_expr, rocdl
+from flydsl.expr import const_expr, range_constexpr, rocdl
 from flydsl.expr.typing import T
 
 from sgl_amd_mono.common.guard import stop_launch
@@ -42,6 +56,7 @@ from sgl_amd_mono.common.sync import CHECK_POLLS
 from sgl_amd_mono.qwen38_flash_next.decode.wide.abi import (
     FAILED,
     RECORD_WORDS,
+    SITE_FLAG,
     SITE_GRID,
     WAIT_TICKS,
 )
@@ -65,6 +80,12 @@ SLOT_WORDS = STRIPES * STRIPE_WORDS  # a launch slot's barrier counters
 FOLD_BASE = 2 * SLOT_WORDS  # the fold counters follow both slots' stripes
 FOLD_STRIDE = 16  # a fold counter's words: one 64-byte line
 FOLD_COUNTERS = 512
+# stop mode's deadline grace, an eighth of the deadline (`deadlines`): far above a
+# wait's check period (`CHECK_POLLS` polls, microseconds) and the start skew between
+# a wait and the waits behind it (within a launch, milliseconds), and the latest
+# deadline, 1.25 times SGLang's (half the watchdog, at most 60 s), stays below the
+# watchdog
+GRACES = 8
 
 
 def sync_words() -> int:
@@ -186,22 +207,20 @@ def failed(g):
 
 
 @traced
-def fail_stop(g):
-    """A stop-mode wait past its deadline: its rank's word in every rank's
-    flags, drained, then the launch's fault."""
-    if const_expr(g.flags is not None):
-        for f in g.every:
-            st(f, g.rank, fx.Int32(1), cm=CM_SYS)
+def fail_stop(g, site):
+    """A stop-mode wait at `site` past its deadline: its rank's word in every
+    other rank's flags, drained, then the launch's fault at page `site`."""
+    for r in range_constexpr(len(g.every)):
+        if g.rank != fx.Int32(r):
+            st(g.every[r], g.rank, fx.Int32(1), cm=CM_SYS)
     rocdl.s_waitcnt(vmcnt=0)
-    stop_launch()
+    stop_launch(site)
 
 
 def peers_failed(g):
-    """Whether any rank's word in this rank's flags is set (system scope)."""
-    n = len(g.every)
-    words = ld(g.flags, 0, fx.Int32, 1 if n == 1 else 2 if n == 2 else 4, cm=CM_SYS)
-    if n == 1:
-        return words != fx.Int32(0)
+    """Whether any peer's word in this rank's flags is set (system scope; two
+    to four ranks)."""
+    words = ld(g.flags, 0, fx.Int32, 2 if len(g.every) == 2 else 4, cm=CM_SYS)
     acc = words[0]
     for e in range(1, words.numel):
         acc = acc | words[e]
@@ -213,19 +232,33 @@ def pending(pend, stall):
     return pend if stall is None else pend | stall
 
 
+def deadlines(g, site):
+    """A stop-mode wait's deadlines in ticks (the module docstring): the wait's
+    at `site` (the build's, a grid barrier's a grace later), and an exchange
+    wait's while a peer's line is missing (two graces later)."""
+    grace = g.ticks // GRACES
+    return g.ticks + (grace if site == SITE_GRID else 0), g.ticks + 2 * grace
+
+
 @traced
-def check(g, t0, leader=None):
-    """A pending stop-mode wait's check (every `CHECK_POLLS` polls): past the
-    deadline from `t0`, `fail_stop` (on the `leader` lanes when given); a set
-    word in this rank's flags faults the launch."""
-    late = memrealtime() - t0 > fx.Int64(g.ticks)
+def check(g, t0, site, leader=None, peer=None):
+    """A pending stop-mode wait's check (every `CHECK_POLLS` polls): past its
+    deadline from `t0` (`deadlines`; `peer`: whether a peer's line is missing),
+    `fail_stop` at `site` (on the `leader` lanes when given); a set word in this
+    rank's flags faults the launch at `SITE_FLAG`. With no peer (one rank)
+    nothing writes this rank's flags, so they are not read."""
+    own, peers = deadlines(g, site)
+    limit = fx.Int64(own)
+    if const_expr(peer is not None):
+        limit = peer.select(fx.Int64(peers), limit)
+    late = memrealtime() - t0 > limit
     if const_expr(leader is not None):
         late = late & leader
     if late:
-        fail_stop(g)
-    if const_expr(g.flags is not None):
+        fail_stop(g, site)
+    if const_expr(len(g.every) > 1):
         if peers_failed(g):
-            stop_launch()
+            stop_launch(SITE_FLAG)
 
 
 @traced
@@ -265,7 +298,7 @@ def _poll_stripes_stop(g, target, stall):
         behind = _behind(ld(g.sync, lane_word, fx.Int32, cm=CM_DEV), target)
         polls = polls + 1
         if (polls & fx.Int32(CHECK_POLLS - 1)) == fx.Int32(0):
-            check(g, t0, g.lane == 0)
+            check(g, t0, SITE_GRID, g.lane == 0)
 
 
 def _behind(seen, target):

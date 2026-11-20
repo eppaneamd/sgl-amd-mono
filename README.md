@@ -27,7 +27,7 @@ The library implements SGLang's monokernel interface ([RFC #43949](https://githu
 | Qwen3.5-397B-A17B-FP8 | MI355X (gfx950) | 4, 8 (MTP verify: 4) | Decode steps of up to 8 rows, and EAGLE/MTP target-verify steps of up to 8 requests x 4 draft tokens: every layer's norms, FP8 quants and dense projections, and the 45 GDN layers' conv and gated delta (two launches a GDN layer in decode, three in verify). Attention, the MoE and the MTP draft run SGLang's kernels. See [its README](sgl_amd_mono/qwen35_a17b/README.md) |
 | Qwen3.8-2.4T-A95B (MXFP4 experts) | MI355X (gfx950) | 8 | All 92 layers in decode steps of up to 8 rows, and the layer tail (K2) of all 92 in NEXTN verify steps of up to 8 rows |
 | Qwen3.8-Flash-Next (MXFP4) | MI355X (gfx950) | 1 | The whole model (48 layers in 13 launches) in NEXTN verify steps of up to 8 requests x 4 tokens; the MTP draft's draft extend (up to 8 x 4 rows) and draft decode steps (up to 8 x 1) are routed to its launch |
-| Qwen3.8-Flash-Next (MXFP4, BF16 attention) | MI355X (gfx950) | 1, 2 | All 48 layers in decode steps of up to 192 rows at TP2, or 64 at TP1 without speculative decoding: a launch a Gated DeltaNet layer, and two a QSA layer around SGLang's sparse attention. See [its README](sgl_amd_mono/qwen38_flash_next/decode/README.md) |
+| Qwen3.8-Flash-Next (MXFP4, BF16 attention) | MI355X (gfx950) | 1, 2 | All 48 layers in decode steps of up to 192 rows at TP2, or 64 at TP1 without speculative decoding: a launch a Gated DeltaNet layer, and two a QSA layer around SGLang's sparse attention; the GDN projections as MXFP4 copies of the BF16 weights (W4A16). See [its README](sgl_amd_mono/qwen38_flash_next/decode/README.md) |
 
 ### Design
 

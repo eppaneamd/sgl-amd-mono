@@ -13,12 +13,16 @@ bump, and the TP exchange tags carry it), the health words and the peer
 mailboxes of the TP exchange (``common.peer.PeerBuffer``).
 
 Every launch is built in SGLang's setting: the conv state as SGLang lays it out
-(``conv_dim_first``), every wait's deadline SGLang's (``BuildContext.deadline_s``,
-below the watchdog) and stop mode, where a wait past its deadline raises this
-rank's flag in every rank's peer buffer and faults the launch at the null page;
-a rank whose peer raised its flag stops the same way. The peer buffer's first
-``PEER_HEAD`` bytes hold those flags: zeroed at allocation
-(``peer._alloc_uncached``) and written by nothing else.
+(``conv_dim_first``), the waits' deadlines from SGLang's
+(``BuildContext.deadline_s``, D: a grid barrier waits D + D/8 and an exchange
+line a peer has not written D + 2 D/8, at most 0.625 of the watchdog;
+``wide.common.grid.deadlines``) and stop mode, where a wait past its deadline
+raises this rank's flag in every other rank's peer buffer (not its own, so its
+GPU's first fault, the one the runtime reports, is at a wait's page) and faults
+the launch at its wait kind's page (``wide.common.grid``); a rank whose peer
+raised its flag faults at the flag's page. The peer buffer's first ``PEER_HEAD``
+bytes hold those flags: zeroed at allocation (``peer._alloc_uncached``) and
+written by nothing else.
 """
 
 from __future__ import annotations
@@ -28,7 +32,6 @@ from collections.abc import Iterable
 import torch
 
 from sgl_amd_mono.common import guard
-from sgl_amd_mono.qwen38_flash_next.decode import allreduce_codec
 from sgl_amd_mono.qwen38_flash_next.decode.weights import Layer
 from sgl_amd_mono.qwen38_flash_next.decode.wide import layer as K
 from sgl_amd_mono.qwen38_flash_next.decode.wide import layout as L
@@ -75,7 +78,8 @@ class Launcher:
             raise ValueError(
                 f"{self.launches} launches a step: the barrier slots need an even count"
             )
-        self.codec = allreduce_codec(tp)
+        # exact bf16 sums in rank order, as SGLang's decode all-reduce at these sizes
+        self.codec = "bf16"
         self.fault = guard.fault_injection(rank) or NO_FAULT
         top = max(self.widths)
         # zeroed: the MoE's split-unit marks are compared against step tags

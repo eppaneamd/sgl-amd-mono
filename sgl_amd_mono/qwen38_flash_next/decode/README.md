@@ -56,12 +56,9 @@ at build. The TP1 recipe (`test/e2e/qwen38_flash_next_decode_server.py`, `TP1_AR
   with the shared expert fused as expert 512, padded to a multiple of 128 intermediate rows;
 - the GDN states as SGLang keeps them: a bf16 conv state `[slots, CONV_DIM, 3]` and an f32 recurrent state
   `[slots, NV, DV, DK]`, a slot dense, on the triton GDN decode backend; pad rows (slot <= 0) write none;
-- the TP all-reduces send exact bf16 sums in rank order; with `ROCM_QUICK_REDUCE_QUANTIZATION=INT4` they send
-  QuickReduce's INT4 codec lines instead (`decode.allreduce_codec`). SGLang's own decode all-reduce stays exact at
-  these sizes (a 192-row exchange is 0.94 MiB; QuickReduce's INT4 minimum for bf16 at TP2 is 8 MiB), so INT4 makes
-  the launches' exchange lossy where SGLang's is not. At TP1 the exchange is a round trip through the rank's own
-  mailbox (`common.peer.PeerBuffer` opens no peer at one rank), its lines exact bf16 whatever
-  `ROCM_QUICK_REDUCE_QUANTIZATION` asks.
+- the TP all-reduces send exact bf16 sums in rank order; SGLang's decode all-reduce is exact at these sizes too, on
+  AITER's custom all-reduce, which takes it below 64 MiB at TP2 (a 192-row exchange is 0.94 MiB). At TP1 the exchange
+  is a round trip through the rank's own mailbox (`common.peer.PeerBuffer` opens no peer at one rank).
 
 ## Refusals
 
@@ -80,12 +77,26 @@ Default-deny, each stage listing every reason (`spec.py`), the TP ranks agreeing
 
 ## Failure
 
-Every in-kernel wait (grid barrier, TP exchange line, split-K fold) gives up at SGLang's deadline
-(`BuildContext.deadline_s`, half the watchdog timeout, at most 60 s). In stop mode the CTA raises its rank's flag in
-every rank's peer buffer (the first `PEER_HEAD` bytes, zeroed at allocation and written by nothing else) and faults
-the launch at the null page; a rank whose wait finds a peer's flag up faults the same way, without waiting for its own
-deadline. At TP1 there is no peer: the rank's own deadline stops it. `SGLANG_AMD_MONO_FAULT_INJECT=rank:site:after`
-stalls a wait of that rank's launches once the step epoch reaches `after` (test only).
+Every in-kernel wait (grid barrier, TP exchange line, tagged hand-off) gives up at SGLang's deadline D
+(`BuildContext.deadline_s`, half the watchdog timeout, at most 60 s), or a grace of D/8 or two later: a tagged hand-off,
+or an exchange line while only the rank's own lines are missing, at D; a grid barrier at 1.125 D; an exchange line while
+a peer's line is missing at 1.25 D (`wide.common.grid.deadlines`): past the deadline SGLang hands the plugin, but at
+most 0.625 of the watchdog timeout. In stop mode the CTA raises its rank's flag in every other rank's peer buffer (the
+first `PEER_HEAD` bytes, zeroed at allocation and written by nothing else) and faults the launch at its wait kind's
+page; a rank whose wait finds a peer's flag up faults at 0x4000, without waiting for its own deadline. At TP1 there is
+no peer: every line is the rank's own, and its own deadlines stop it. The runtime reports a queue's first fault (CLR's
+"faulting addr", ROCr's "on address"), so a rank does not raise its own flag, and the staggered deadlines make the first
+wait to give up on a GPU one of the kind furthest upstream:
+
+| a GPU's fault at | its first wait to give up | meaning |
+| --- | --- | --- |
+| 0x3000 | a tagged hand-off between the launch's CTAs (`wide/stages/tagged.py`, such as split-K partials) | a CTA of this GPU never handed off its values |
+| 0x2000 | a TP exchange line | a line never came: of this rank (a CTA of its own never wrote it), or of a peer |
+| 0x1000 | a grid barrier | no hand-off or line of its own was missing: a CTA never arrived (not every CTA resident, or one waits on a peer's line) |
+| 0x4000 | a peer's flag | another rank gave up first; its page names the stall |
+
+`SGLANG_AMD_MONO_FAULT_INJECT=rank:site:after` stalls a wait of that rank's launches once the step epoch reaches
+`after` (test only).
 
 ## Check mode
 
