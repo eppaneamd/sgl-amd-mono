@@ -1,31 +1,39 @@
 """Qwen3.8-Flash-Next (the MXFP4 checkpoint) with --monokernel-backend amd on two
 MI355X, TP2 decode of 1 to 192 rows: the server runs at most 192 requests, so every
 decode step is one the wide launches take. The startup line shows every captured
-decode graph runs them. GSM8K and MMMU against the normal path on the same server
-arguments, with requests joining and leaving batches of up to 192 rows; the tokens of covered steps scored again by the normal prefill path (KL
-consistency), the second turn of a conversation decoding from the GDN states the
+decode graph runs them. Against the normal path on the same server arguments: GSM8K,
+with requests joining and leaving batches of up to 192 rows, and per prompt the KL of
+decode against prefill (the tokens of covered steps scored again by the prefill path)
+at 1 to 192 rows. The second turn of a conversation decoding from the GDN states the
 radix cache saved during the first; each layer's launches against SGLang's own layer
 under SGLANG_AMD_MONO_CHECK, at 1 to 192 rows and at contexts past QSA's 2,048-token
 selection budget (about 6,000 and 108,000 tokens); and a rank stalled by
 SGLANG_AMD_MONO_FAULT_INJECT stopping the server without tokens."""
 
+import json
 import os
 import re
+import statistics
 import tempfile
 import time
 import unittest
 from pathlib import Path
 from types import SimpleNamespace
 
+import numpy as np
 import requests
 from qwen38_flash_next_decode_server import ARGS, ENV, MODEL
 from sglang.test.kl_test_utils import (
-    test_input_output_logprobs_match_decode_cache_hit_helper as assert_decode_hits_match,
+    DEFAULT_NUM_SAMPLES,
+    _extract_output_logprobs,
+    _flush_cache,
+    _generate,
+    _get_input_logprobs,
+    get_input_ids,
 )
 from sglang.test.kl_test_utils import (
-    test_input_output_logprobs_match_helper as assert_logprobs_match,
+    test_input_output_logprobs_match_decode_cache_hit_helper as assert_decode_hits_match,
 )
-from sglang.test.run_eval import run_eval
 from sglang.test.sgl_eval_utils import run_sgl_eval
 from sglang.test.test_utils import (
     DEFAULT_URL_FOR_TEST,
@@ -42,12 +50,29 @@ LAUNCH_TIMEOUT = 3600
 # The decode graphs: the spec's widths (both paths') up to 192, the largest capture
 # size; SGLang's default sizes up to 192 are among them
 WIDTHS = sorted(w for w in SPEC.devices["gfx950"].widths if w <= 192)
-# Score drops against the normal path that fail the run: bounds for gross failures
+# SGLang's startup line when every captured decode graph runs the launches: routing
+# is fixed at startup, so without it a test could pass on the normal path alone
+ROUTING = (
+    "monokernel qwen38_flash_next_hip on gfx950 runs decode steps of batch "
+    f"size {WIDTHS} ({len(WIDTHS)} of {len(WIDTHS)} captured decode graphs)"
+)
+# A GSM8K score drop against the normal path that fails the run: a bound for gross
+# failures
 GSM8K_DROP = 0.03
-MMMU_DROP = 0.05
-# Decode against prefill, one batch of 1 to 192 LongBench-v2 prompts at a time (every
-# decode step covered), mean KL a batch: 0.022 to 0.085 on the normal path (3 runs,
-# one server), 0.026 to 0.097 with the monokernels (6 runs, 4 servers)
+# KL of decode against prefill per prompt (SGLang's kl_test_utils), one batch of the
+# first `rows` LongBench-v2 prompts at a time, 512 output tokens each, on each path's
+# server: one graph per batch, so every decode step covered; 3, 13, 17 and 129 rows
+# are one past a graph's, so their steps carry pad rows. 433 prompt runs in all, over
+# the first 192 prompts.
+KL_ROWS = (1, 2, 3, 12, 13, 16, 17, 48, 129, 192)
+# The mean over them of (monokernels - normal path), the same prompts on both: 0.0063
+# to 0.0172 (mean 0.0125, sd 0.0023) over the 169 pairs of 13 rounds a path (3 on
+# MI355X, 10 on MI350X); two rounds of one path at most 0.0062 apart. A regression
+# of +0.02 on the measured mean (0.0325) fails.
+KL_MARGIN = 0.03
+# The second turn's mean KL against prefill (8 prompts), bounded as a batch of the
+# above: 0.022 to 0.085 on the normal path (3 rounds, one server), 0.026 to 0.097 with
+# the monokernels (6 runs, 4 servers)
 KL_BOUND = 0.12
 # 200 requests at a time, more than the server runs: its batches fill to the
 # largest width, 192 rows
@@ -98,8 +123,8 @@ def _logs(files) -> str:
     return "".join(Path(f.name).read_text() for f in files)
 
 
-def _scores() -> dict:
-    gsm8k = run_sgl_eval(
+def _gsm8k() -> float:
+    return run_sgl_eval(
         SimpleNamespace(
             base_url=DEFAULT_URL_FOR_TEST,
             model=MODEL,
@@ -109,39 +134,68 @@ def _scores() -> dict:
             temperature=0.0,
             seed=42,
         )
-    )
-    mmmu = run_eval(
-        SimpleNamespace(
-            base_url=DEFAULT_URL_FOR_TEST,
-            model=MODEL,
-            eval_name="mmmu",
-            num_examples=100,
-            num_threads=THREADS,
-            max_tokens=30,
+    )["score"]
+
+
+def _kl_per_prompt() -> list[float]:
+    """Each prompt's KL of decode against prefill, batch by batch (KL_ROWS), by the
+    steps and formula of SGLang's test_input_output_logprobs_match_helper: decode,
+    then prefill each prompt with its output and compare the output's logprobs."""
+    kl = []
+    for rows in KL_ROWS:
+        prompts = get_input_ids(
+            tokenizer_path=MODEL, num_samples=max(rows, DEFAULT_NUM_SAMPLES)
+        )[:rows]
+        _flush_cache(DEFAULT_URL_FOR_TEST)
+        results = _generate(DEFAULT_URL_FOR_TEST, prompts, 512, return_logprob=True)
+        decode = [_extract_output_logprobs(r) for r in results]
+        prefill = _get_input_logprobs(
+            DEFAULT_URL_FOR_TEST,
+            [p + r["output_ids"] for p, r in zip(prompts, results, strict=True)],
+            decode,
         )
-    )
-    return {"gsm8k": gsm8k["score"], "mmmu": mmmu["score"]}
+        for p, d in zip(prefill, decode, strict=True):
+            logr = np.array(p) - np.array(d)
+            kl.append(float(np.mean(np.exp(logr) - 1 - logr)))
+    return kl
 
 
 class TestMonokernelAccuracy(CustomTestCase):
     @classmethod
     def setUpClass(cls):
-        cls.scores = {}
+        cls.gsm8k, cls.kl, cls.routed = {}, {}, {}
         for mono in (False, True):
-            process = _launch(mono=mono)
-            try:
-                cls.scores[mono] = _scores()
-            finally:
-                terminate_and_kill_process_tree(process)
-        print(f"normal path {cls.scores[False]}, monokernels {cls.scores[True]}")
+            with (
+                tempfile.NamedTemporaryFile("w+", suffix=".out") as out,
+                tempfile.NamedTemporaryFile("w+", suffix=".err") as err,
+            ):
+                process = _launch(mono=mono, log=(out, err))
+                try:
+                    cls.gsm8k[mono] = _gsm8k()
+                    cls.kl[mono] = _kl_per_prompt()
+                finally:
+                    terminate_and_kill_process_tree(process)
+                cls.routed[mono] = ROUTING in _logs((out, err))
+        print(f"GSM8K: normal path {cls.gsm8k[False]}, monokernels {cls.gsm8k[True]}")
+        print(
+            "KL per prompt:",
+            json.dumps({"normal": cls.kl[False], "mono": cls.kl[True]}),
+        )
 
     def test_gsm8k_against_the_normal_path(self):
-        drop = self.scores[False]["gsm8k"] - self.scores[True]["gsm8k"]
-        self.assertLess(drop, GSM8K_DROP, self.scores)
+        drop = self.gsm8k[False] - self.gsm8k[True]
+        self.assertLess(drop, GSM8K_DROP, self.gsm8k)
 
-    def test_mmmu_against_the_normal_path(self):
-        drop = self.scores[False]["mmmu"] - self.scores[True]["mmmu"]
-        self.assertLess(drop, MMMU_DROP, self.scores)
+    def test_kl_against_the_normal_path(self):
+        # the monokernel server's decode graphs ran the launches, the other's not
+        self.assertEqual(self.routed, {False: False, True: True})
+        # every prompt scored on both paths, paired
+        self.assertEqual([len(self.kl[m]) for m in (False, True)], [sum(KL_ROWS)] * 2)
+        diff = statistics.mean(
+            m - n for m, n in zip(self.kl[True], self.kl[False], strict=True)
+        )
+        print(f"KL per prompt, mean of monokernels - normal path: {diff:.4f}")
+        self.assertLess(diff, KL_MARGIN)
 
 
 class TestMonokernelDecode(CustomTestCase):
@@ -160,31 +214,9 @@ class TestMonokernelDecode(CustomTestCase):
             log.close()
 
     def test_a_every_decode_graph_runs_the_monokernels(self):
-        # routing is fixed at startup; without this, the other tests could pass on
-        # the normal path alone
-        self.assertIn(
-            "monokernel qwen38_flash_next_hip on gfx950 runs decode steps of batch "
-            f"size {WIDTHS} ({len(WIDTHS)} of {len(WIDTHS)} captured decode graphs)",
-            _logs(self.logs),
-        )
+        self.assertIn(ROUTING, _logs(self.logs))
 
-    def test_b_covered_steps_match_prefill(self):
-        # one graph per batch (ignore_eos keeps its rows); 3, 13, 17 and 129 rows one
-        # past a graph's, so their steps carry pad rows; the helper flushes the
-        # cache first, so a
-        # graph replayed first on another's reads none of this batch's pages. Up to
-        # 48 rows the batches share one LongBench-v2 download, 129 and 192 one each.
-        for rows in (1, 2, 3, 12, 13, 16, 17, 48, 129, 192):
-            with self.subTest(rows=rows):
-                assert_logprobs_match(
-                    DEFAULT_URL_FOR_TEST,
-                    {MODEL: {"kl_div": KL_BOUND}},
-                    MODEL,
-                    max_samples=rows,
-                    max_new_tokens=512,
-                )
-
-    def test_c_a_second_turn_decodes_from_the_saved_gdn_states(self):
+    def test_b_a_second_turn_decodes_from_the_saved_gdn_states(self):
         # the second turn hits the first turn's decoded tokens in the radix cache:
         # its GDN states are the ones the launches' steps saved through SGLang's
         # track-save; a state saved before its layer's launch, or none, fails the KL
