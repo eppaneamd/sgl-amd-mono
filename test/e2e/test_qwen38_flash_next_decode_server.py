@@ -74,6 +74,11 @@ CHECK_METRICS = (
     "qsa.qkv.cosine",
     "qsa.ix.cosine",
 )
+# The fault test: a stopped launch faults at its wait kind's page (a grid barrier,
+# a TP exchange line, a tagged hand-off between CTAs), or at the flag's for a peer's
+# flag
+WAIT_PAGES = {0x1000, 0x2000, 0x3000}
+FLAG_PAGE = 0x4000
 
 
 def _launch(mono=True, extra_env=None, extra_args=(), log=None):
@@ -270,7 +275,8 @@ class TestMonokernelFault(CustomTestCase):
     def test_a_stalled_rank_stops_the_server_without_tokens(self):
         # once the step epoch reaches 1000 (startup's graph warmups run a few steps
         # of each width), rank 1 stalls at the first wait of its launches; at the
-        # deadline (watchdog / 2) it raises its flag and both ranks stop
+        # deadline (watchdog / 2) it raises its flag and both ranks stop: rank 1 at
+        # its wait kind's page, rank 0 at the flag's
         with (
             tempfile.NamedTemporaryFile("w+", suffix=".out") as out,
             tempfile.NamedTemporaryFile("w+", suffix=".err") as err,
@@ -310,14 +316,20 @@ class TestMonokernelFault(CustomTestCase):
                     time.sleep(2)
                 self.assertIsNotNone(process.poll(), "the server kept running")
                 log = _logs((out, err))
-                # a launch stops with a store to the null page: the only faults are
-                # at address 0x0 (CLR's "faulting addr: 0x0", ROCr's "on address
-                # (nil)")
-                faults = re.findall(
-                    r"(?:faulting addr: |on address )(0x[0-9a-fA-F]+|\(nil\))", log
-                )
+                # a launch stops with a store to its wait kind's page (CLR's
+                # "faulting addr: 0x...", ROCr's "on address 0x..."): the only
+                # faults are there, rank 0's at the flag's page
+                faults = {
+                    0 if a == "(nil)" else int(a, 16)
+                    for a in re.findall(
+                        r"(?:faulting addr: |on address )(0x[0-9a-fA-F]+|\(nil\))",
+                        log,
+                    )
+                }
                 self.assertTrue(faults, log[-2000:])
-                self.assertEqual(set(faults) - {"0x0", "(nil)"}, set(), faults)
+                self.assertLessEqual(faults, WAIT_PAGES | {FLAG_PAGE}, faults)
+                self.assertIn(FLAG_PAGE, faults)
+                self.assertTrue(faults & WAIT_PAGES, faults)
             finally:
                 terminate_and_kill_process_tree(process)
 

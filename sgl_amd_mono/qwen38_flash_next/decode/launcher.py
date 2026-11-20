@@ -15,10 +15,12 @@ mailboxes of the TP exchange (``common.peer.PeerBuffer``).
 Every launch is built in SGLang's setting: the conv state as SGLang lays it out
 (``conv_dim_first``), every wait's deadline SGLang's (``BuildContext.deadline_s``,
 below the watchdog) and stop mode, where a wait past its deadline raises this
-rank's flag in every rank's peer buffer and faults the launch at the null page;
-a rank whose peer raised its flag stops the same way. The peer buffer's first
-``PEER_HEAD`` bytes hold those flags: zeroed at allocation
-(``peer._alloc_uncached``) and written by nothing else.
+rank's flag in every other rank's peer buffer (not its own, so its GPU's first
+fault, the one the runtime reports, is at a wait's page) and faults the launch at
+its wait kind's page (``wide.common.grid``); a rank whose peer raised its flag
+faults at the flag's page. The peer buffer's first ``PEER_HEAD`` bytes hold those
+flags: zeroed at allocation (``peer._alloc_uncached``) and written by nothing
+else.
 """
 
 from __future__ import annotations

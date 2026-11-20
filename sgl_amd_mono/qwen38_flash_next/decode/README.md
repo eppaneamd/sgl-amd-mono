@@ -55,12 +55,16 @@ Default-deny, each stage listing every reason (`spec.py`), the TP ranks agreeing
 
 ## Failure
 
-Every in-kernel wait (grid barrier, TP exchange line, split-K fold) gives up at SGLang's deadline
+Every in-kernel wait (grid barrier, TP exchange line, tagged hand-off) gives up at SGLang's deadline
 (`BuildContext.deadline_s`, half the watchdog timeout, at most 60 s). In stop mode the CTA raises its rank's flag in
-every rank's peer buffer (the first `PEER_HEAD` bytes, zeroed at allocation and written by nothing else) and faults
-the launch at the null page; a rank whose wait finds a peer's flag up faults the same way, without waiting for its own
-deadline. `SGLANG_AMD_MONO_FAULT_INJECT=rank:site:after` stalls a wait of that rank's launches once the step
-epoch reaches `after` (test only).
+every other rank's peer buffer (the first `PEER_HEAD` bytes, zeroed at allocation and written by nothing else) and
+faults the launch at its wait kind's page: address 0x1000 a grid barrier, 0x2000 a TP exchange line, 0x3000 a tagged
+hand-off between the launch's CTAs (`wide/stages/tagged.py`). A rank whose wait finds a peer's flag up faults at
+0x4000, without waiting for its own deadline. The runtime reports a queue's first fault (CLR's "faulting addr", ROCr's
+"on address"), so a rank does not raise its own flag: its GPU's report names the kind of wait that timed out first
+there. That can be a wait behind the stuck one, such as a grid barrier after a hand-off that never came.
+`SGLANG_AMD_MONO_FAULT_INJECT=rank:site:after` stalls a wait of that rank's launches once the step epoch reaches
+`after` (test only).
 
 ## Check mode
 

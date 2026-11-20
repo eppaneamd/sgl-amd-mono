@@ -79,8 +79,8 @@ def _stale(seen, tag):
 def poll(g, specs, tag):
     """The values of every `(addr, first pair, pairs)` of `specs` (pairs 1, 2
     or 4), all re-loaded together until every tag is `tag`; bounded, a
-    timeout recorded as a fold's (`grid`: or in stop mode a fault). Returns
-    per spec its value words (Int32)."""
+    timeout recorded at `SITE_FOLD` (`grid`: or in stop mode a fault at its
+    page). Returns per spec its value words (Int32)."""
     if g.stop:
         return _values(specs, _poll_stop(g, specs, tag, g.next_wait()))
     return _poll(g, specs, tag)
@@ -113,7 +113,7 @@ def _poll_stop(g, specs, tag, stall):
         pend = _stale(seen, tag)
         polls = polls + 1
         if (polls & i32(CHECK_POLLS - 1)) == i32(0):
-            check(g, t0)
+            check(g, t0, SITE_FOLD)
     return seen
 
 

@@ -292,7 +292,7 @@ def _wait_lines_stop(g, ex, lines, stall):
         pend = _untagged(ex, seen)
         polls = polls + 1
         if (polls & fx.Int32(CHECK_POLLS - 1)) == fx.Int32(0):
-            check(g, t0)
+            check(g, t0, SITE_PEER)
     return [v - ex.tag for v in seen]
 
 

@@ -8,8 +8,8 @@ controls break one launch on rank 1 in vLLM's setting and check that the matchin
 check fires: a lost publish (rank 0's wait gives up at ``abi.WAIT_TICKS`` and the
 launch ends), a corrupt input (the reference check) and different injection scales
 (the cross-rank digest). In SGLang's setting the fault injection stalls one rank's
-wait: its deadline faults it, and its flag faults the other rank long before that
-rank's own deadline.
+wait: its deadline faults it at that wait's page, and its flag faults the other rank
+at the flag's page long before that rank's own deadline.
 
 The harness spawns and waits for each rank itself, so a rank that never stops is
 seen and killed at the hang limit instead of hanging the test."""
@@ -32,13 +32,16 @@ WIDTHS = sorted({1, 2, 4, 8, 12, *range(16, 193, 8), 129})
 ITERS = 1000
 CONTROL_ROWS, CONTROL_ITER = 129, 10
 WAIT_S = 10  # abi.WAIT_SECONDS
-SITE_PEER = 2  # abi.SITE_PEER
+SITE_GRID, SITE_PEER, SITE_FLAG = 1, 2, 4  # abi's; in stop mode the fault's page
 # the fault test: the stalled rank's deadline (SGLang's least: half of the 10 s
 # `--watchdog-timeout` it accepts) and the other rank's (SGLang's default), and
-# the worker kernel's first wait (the attention lines in `hc.combine`) stalled
-# once the epoch reaches 2: launch LAYERS, after a whole step
+# the worker kernel's second wait (the grid barrier between its two exchanges)
+# stalled once the epoch reaches 2: launch LAYERS, after a whole step. Every CTA
+# takes that barrier, so it is the stalled rank's only pending wait; at the first
+# wait (the attention lines in `hc.combine`) only the CTAs with a row would stall,
+# and the rest would time out at the barrier after it
 FAULT_WAIT_S, OTHER_WAIT_S = 5.0, 60.0
-FAULT_ROWS, FAULT_SITE, FAULT_AFTER, LAYERS = 129, 1, 2, 48
+FAULT_ROWS, FAULT_SITE, FAULT_AFTER, LAYERS = 129, 2, 2, 48
 # a GPU memory fault as the runtime reports it: ROCr's "Memory access fault by GPU
 # node-%u (Agent handle: %p) on address %p%s. Reason: %s." (glibc's %p of 0 is
 # "(nil)"), or CLR's "[host: ..., GPU index: %u, faulting addr: 0x%x, kernel: ...]"
@@ -180,15 +183,16 @@ def test_rank_mismatch_fails_the_digest(tmp_path):
 
 @pytest.mark.parametrize("stalled", [1, 0])
 def test_a_stalled_rank_faults_both_ranks_by_its_deadline(tmp_path, stalled):
-    """SGLang's setting, rank `stalled`'s first wait of launch LAYERS stalled
+    """SGLang's setting, rank `stalled`'s grid barrier of launch LAYERS stalled
     (SGLANG_AMD_MONO_FAULT_INJECT): after the first step on both ranks, its
-    FAULT_WAIT_S deadline faults it at the null page, and the flag it raised in
-    the other rank's peer buffer faults the other rank (waiting on its MLP
-    lines) at the null page too, long before that rank's own OTHER_WAIT_S
+    FAULT_WAIT_S deadline faults it at the grid barrier's page, and the flag it
+    raised in the other rank's peer buffer faults the other rank (waiting on its
+    MLP lines) at the flag's page, long before that rank's own OTHER_WAIT_S
     deadline."""
     other = 1 - stalled
     waits = [OTHER_WAIT_S, OTHER_WAIT_S]
     waits[stalled] = FAULT_WAIT_S
+    pages = {stalled: SITE_GRID << 12, other: SITE_FLAG << 12}
     procs = _start(
         tmp_path,
         ["--setting", "sglang", "--codecs", "bf16", "--widths", str(FAULT_ROWS),
@@ -202,10 +206,11 @@ def test_a_stalled_rank_faults_both_ranks_by_its_deadline(tmp_path, stalled):
     for r, p in enumerate(procs):
         log = (tmp_path / f"rank{r}.log").read_text()
         found = faults(log)
-        # only stop_launch's faults: at the null page
-        assert p.returncode != 0 and found and all(a == 0 for a, _ in found), (
-            f"rank {r} exited {p.returncode}, faults {found}:\n{log[-3000:]}"
+        # only stop_launch's faults, at the page of the rank's wait kind
+        assert p.returncode != 0 and found, (
+            f"rank {r} exited {p.returncode}, no fault:\n{log[-3000:]}"
         )
+        assert all(a == pages[r] for a, _ in found), (r, hex(pages[r]), found)
         # every launch of the first step returned, and none after it
         rows = (tmp_path / f"progress{r}").read_text().split()
         assert [int(i) for i in rows[::2]] == list(range(LAYERS)), rows[::2]
