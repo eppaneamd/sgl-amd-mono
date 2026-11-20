@@ -77,6 +77,14 @@ CHECK_METRICS = (
     "qsa.qkv.cosine",
     "qsa.ix.cosine",
 )
+# The fault test: the rank's launches stall at their second wait once the step epoch
+# reaches 1000 (startup's graph warmups run a few steps of each width). The first is
+# layer 0's, a stats build, whose waits at the request's 1 row run (trace order) the
+# stats phase's grid barrier, then the attention mix's split-K partials, a tagged
+# hand-off (`hc._down_unit`'s `tagged.poll`). The rank faults at the hand-off's page
+# (its grid barriers give up a grace later); there is no peer to flag
+FAULT_INJECT = "0:2:1000"
+FAULT_PAGES = {0x3000}
 
 
 def _launch(mono=True, extra_env=None, extra_args=(), log=None):
@@ -282,16 +290,15 @@ class TestMonokernelCheck(CustomTestCase):
 
 class TestMonokernelFault(CustomTestCase):
     def test_a_stalled_rank_stops_the_server_without_tokens(self):
-        # once the step epoch reaches 1000 (startup's graph warmups run a few steps
-        # of each width), the one rank stalls at the first wait of its launches; at
-        # its deadline (watchdog / 2) it faults its launch and the server stops
+        # the rank stalls at a tagged hand-off (FAULT_INJECT); at the deadline
+        # (watchdog / 2) it faults its launch at FAULT_PAGES and the server stops
         with (
             tempfile.NamedTemporaryFile("w+", suffix=".out") as out,
             tempfile.NamedTemporaryFile("w+", suffix=".err") as err,
         ):
             process = _launch(
                 extra_env={
-                    "SGLANG_AMD_MONO_FAULT_INJECT": "0:1:1000",
+                    "SGLANG_AMD_MONO_FAULT_INJECT": FAULT_INJECT,
                     # the stop faults the GPU on purpose: no crash dumps, which
                     # would hold the rank up for minutes
                     "HSA_DISABLE_COREDUMP_ON_EXCEPTION": "1",
@@ -324,14 +331,16 @@ class TestMonokernelFault(CustomTestCase):
                     time.sleep(2)
                 self.assertIsNotNone(process.poll(), "the server kept running")
                 log = _logs((out, err))
-                # a launch stops with a store to the null page: the only faults are
-                # at address 0x0 (CLR's "faulting addr: 0x0", ROCr's "on address
-                # (nil)")
-                faults = re.findall(
-                    r"(?:faulting addr: |on address )(0x[0-9a-fA-F]+|\(nil\))", log
-                )
-                self.assertTrue(faults, log[-2000:])
-                self.assertEqual(set(faults) - {"0x0", "(nil)"}, set(), faults)
+                # a launch stops with a store to its wait kind's page (CLR's
+                # "faulting addr: 0x...", ROCr's "on address 0x...")
+                faults = {
+                    0 if a == "(nil)" else int(a, 16)
+                    for a in re.findall(
+                        r"(?:faulting addr: |on address )(0x[0-9a-fA-F]+|\(nil\))",
+                        log,
+                    )
+                }
+                self.assertEqual(faults, FAULT_PAGES, log[-2000:])
             finally:
                 terminate_and_kill_process_tree(process)
 
