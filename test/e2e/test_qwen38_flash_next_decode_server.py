@@ -142,12 +142,12 @@ def _gsm8k() -> float:
     )["score"]
 
 
-def _kl_per_prompt() -> list[float]:
-    """Each prompt's KL of decode against prefill, batch by batch (KL_ROWS), by the
+def _kl_per_prompt(batches=KL_ROWS) -> list[float]:
+    """Each prompt's KL of decode against prefill, batch by batch (`batches`), by the
     steps and formula of SGLang's test_input_output_logprobs_match_helper: decode,
     then prefill each prompt with its output and compare the output's logprobs."""
     kl = []
-    for rows in KL_ROWS:
+    for rows in batches:
         prompts = get_input_ids(
             tokenizer_path=MODEL, num_samples=max(rows, DEFAULT_NUM_SAMPLES)
         )[:rows]
