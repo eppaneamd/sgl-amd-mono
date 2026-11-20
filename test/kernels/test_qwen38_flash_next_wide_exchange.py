@@ -9,7 +9,7 @@ check fires: a lost publish (rank 0's wait gives up at ``abi.WAIT_TICKS`` and th
 launch ends), a corrupt input (the reference check) and different injection scales
 (the cross-rank digest). In SGLang's setting the fault injection stalls one rank's
 wait: its deadline faults it at that wait's page, and its flag faults the other rank
-at the flag's page long before that rank's own deadline.
+at the flag's page before that rank's own waits give up.
 
 The harness spawns and waits for each rank itself, so a rank that never stops is
 seen and killed at the hang limit instead of hanging the test."""
@@ -33,15 +33,16 @@ ITERS = 1000
 CONTROL_ROWS, CONTROL_ITER = 129, 10
 WAIT_S = 10  # abi.WAIT_SECONDS
 SITE_GRID, SITE_PEER, SITE_FLAG = 1, 2, 4  # abi's; in stop mode the fault's page
+GRACE = 1 / 8  # grid.GRACES: a grid barrier gives up a grace after the deadline
 # the fault test: the stalled rank's deadline (SGLang's least: half of the 10 s
 # `--watchdog-timeout` it accepts) and the other rank's (SGLang's default), and
-# the worker kernel's second wait (the grid barrier between its two exchanges)
-# stalled once the epoch reaches 2: launch LAYERS, after a whole step. Every CTA
-# takes that barrier, so it is the stalled rank's only pending wait; at the first
-# wait (the attention lines in `hc.combine`) only the CTAs with a row would stall,
-# and the rest would time out at the barrier after it
+# the worker kernel's waits, stalled once the epoch reaches 2 (launch LAYERS,
+# after a whole step): its first, the attention lines in `hc.combine`, which only
+# the CTAs with a row take (the rest wait at the grid barrier after it, which gives
+# up a grace later), or its second, that grid barrier, which every CTA takes
 FAULT_WAIT_S, OTHER_WAIT_S = 5.0, 60.0
-FAULT_ROWS, FAULT_SITE, FAULT_AFTER, LAYERS = 129, 2, 2, 48
+FAULT_ROWS, FAULT_AFTER, LAYERS = 129, 2, 48
+LINES, BARRIER = (1, SITE_PEER), (2, SITE_GRID)  # (worker wait, its page's site)
 # a GPU memory fault as the runtime reports it: ROCr's "Memory access fault by GPU
 # node-%u (Agent handle: %p) on address %p%s. Reason: %s." (glibc's %p of 0 is
 # "(nil)"), or CLR's "[host: ..., GPU index: %u, faulting addr: 0x%x, kernel: ...]"
@@ -181,25 +182,38 @@ def test_rank_mismatch_fails_the_digest(tmp_path):
     assert r1["mismatch_iters"] == 1 and r1["mismatch_at_control"] > 0
 
 
-@pytest.mark.parametrize("stalled", [1, 0])
-def test_a_stalled_rank_faults_both_ranks_by_its_deadline(tmp_path, stalled):
-    """SGLang's setting, rank `stalled`'s grid barrier of launch LAYERS stalled
+@pytest.mark.parametrize(
+    "stalled, wait, other_wait_s",
+    [(1, BARRIER, OTHER_WAIT_S), (0, LINES, OTHER_WAIT_S), (1, BARRIER, FAULT_WAIT_S)],
+    ids=["barrier", "lines", "barrier-same-deadline"],
+)
+def test_a_stalled_rank_faults_both_ranks_by_its_deadline(
+    tmp_path, stalled, wait, other_wait_s
+):
+    """SGLang's setting, a wait of rank `stalled`'s launch LAYERS stalled
     (SGLANG_AMD_MONO_FAULT_INJECT): after the first step on both ranks, its
-    FAULT_WAIT_S deadline faults it at the grid barrier's page, and the flag it
-    raised in the other rank's peer buffer faults the other rank (waiting on its
-    MLP lines) at the flag's page, long before that rank's own OTHER_WAIT_S
-    deadline."""
+    deadline (FAULT_WAIT_S; a grid barrier's a grace later) faults it at that
+    wait's page, not at a wait behind it, and the flag it raised in the other
+    rank's peer buffer faults the other rank (waiting on its lines) at the flag's
+    page: long before that rank's own OTHER_WAIT_S deadline, or with the same
+    deadline before its waits on the stalled rank's lines give up two graces
+    later. A stalled rank that raised its own flag too could fault at the flag's
+    page first: a barrier case catches that about 2 runs in 3 (4 of 6 runs, before
+    the staggered deadlines; 0 of 6 at the lines), so the two miss it about 11 % of
+    the time."""
     other = 1 - stalled
-    waits = [OTHER_WAIT_S, OTHER_WAIT_S]
+    waits = [other_wait_s, other_wait_s]
     waits[stalled] = FAULT_WAIT_S
-    pages = {stalled: SITE_GRID << 12, other: SITE_FLAG << 12}
+    site, kind = wait
+    pages = {stalled: kind << 12, other: SITE_FLAG << 12}
+    deadline_s = FAULT_WAIT_S * (1 + GRACE if kind == SITE_GRID else 1)
     procs = _start(
         tmp_path,
         ["--setting", "sglang", "--codecs", "bf16", "--widths", str(FAULT_ROWS),
          "--iters", str(2 * LAYERS)],
         rank_args=[("--wait-s", str(w), "--progress", str(tmp_path / f"progress{r}"))
                    for r, w in enumerate(waits)],
-        env={"SGLANG_AMD_MONO_FAULT_INJECT": f"{stalled}:{FAULT_SITE}:{FAULT_AFTER}"},
+        env={"SGLANG_AMD_MONO_FAULT_INJECT": f"{stalled}:{site}:{FAULT_AFTER}"},
     )  # fmt: skip
     ends = _wait(procs, hang_s=600)
     last, stamps = [], []
@@ -219,12 +233,13 @@ def test_a_stalled_rank_faults_both_ranks_by_its_deadline(tmp_path, stalled):
     # the stalled rank: its deadline, from its stalled launch's start, then the
     # runtime's teardown
     took = ends[stalled] - last[stalled]
-    assert 0.95 * FAULT_WAIT_S <= took <= FAULT_WAIT_S + 15, took
+    assert 0.95 * deadline_s <= took <= deadline_s + 15, took
     # the other rank: the stalled rank's flag, not its own deadline
-    assert ends[other] - last[other] < OTHER_WAIT_S / 2, ends[other] - last[other]
+    if other_wait_s == OTHER_WAIT_S:
+        assert ends[other] - last[other] < OTHER_WAIT_S / 2, ends[other] - last[other]
     assert abs(ends[other] - ends[stalled]) < 15, ends
     if None not in stamps:
         # CLR's fault times: the stalled rank at its deadline, the other with it
         took = stamps[stalled] - last[stalled]
-        assert 0.95 * FAULT_WAIT_S <= took <= FAULT_WAIT_S + 1, took
+        assert 0.95 * deadline_s <= took <= deadline_s + 1, took
         assert abs(stamps[other] - stamps[stalled]) < 1, stamps

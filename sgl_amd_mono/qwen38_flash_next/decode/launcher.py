@@ -13,14 +13,16 @@ bump, and the TP exchange tags carry it), the health words and the peer
 mailboxes of the TP exchange (``common.peer.PeerBuffer``).
 
 Every launch is built in SGLang's setting: the conv state as SGLang lays it out
-(``conv_dim_first``), every wait's deadline SGLang's (``BuildContext.deadline_s``,
-below the watchdog) and stop mode, where a wait past its deadline raises this
-rank's flag in every other rank's peer buffer (not its own, so its GPU's first
-fault, the one the runtime reports, is at a wait's page) and faults the launch at
-its wait kind's page (``wide.common.grid``); a rank whose peer raised its flag
-faults at the flag's page. The peer buffer's first ``PEER_HEAD`` bytes hold those
-flags: zeroed at allocation (``peer._alloc_uncached``) and written by nothing
-else.
+(``conv_dim_first``), the waits' deadlines from SGLang's
+(``BuildContext.deadline_s``, D: a grid barrier waits D + D/8 and an exchange
+line a peer has not written D + 2 D/8, at most 0.625 of the watchdog;
+``wide.common.grid.deadlines``) and stop mode, where a wait past its deadline
+raises this rank's flag in every other rank's peer buffer (not its own, so its
+GPU's first fault, the one the runtime reports, is at a wait's page) and faults
+the launch at its wait kind's page (``wide.common.grid``); a rank whose peer
+raised its flag faults at the flag's page. The peer buffer's first ``PEER_HEAD``
+bytes hold those flags: zeroed at allocation (``peer._alloc_uncached``) and
+written by nothing else.
 """
 
 from __future__ import annotations

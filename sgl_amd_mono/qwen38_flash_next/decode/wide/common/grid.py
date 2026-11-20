@@ -28,13 +28,21 @@ polls. Past its deadline it raises its rank's word in every other rank's flags
 (`guard.stop_launch`: 0x1000 a grid barrier, 0x2000 a TP exchange line, 0x3000 a
 tagged hand-off between CTAs); a peer's word set in its rank's flags faults it at
 `SITE_FLAG`'s page, 0x4000, so after a timeout on one rank every other rank
-faults at its first wait for the stopped rank's data. A rank never raises its
-own word: the runtime reports a queue's first fault, so the GPU whose wait timed
-out must not fault at the flag's page first. Its fault names the kind of its
-first wait to time out, which can be a wait behind the stuck one (a grid barrier
-after a hand-off that never came). A launch never runs on with words that did
-not come. `Grid.inject` stalls one wait for the fault injection
+faults at its first wait for the stopped rank's data. A launch never runs on with
+words that did not come. `Grid.inject` stalls one wait for the fault injection
 (`guard.fault_injection`).
+
+The runtime reports a queue's first fault, so the waits that give up first name
+the stall: a rank never raises its own word (its GPU would fault at the flag's
+page first), and the deadlines are staggered (`deadlines`) so that the first wait
+to give up is of the kind furthest upstream. A hand-off from this GPU (a tagged
+hand-off; an exchange line, while only this rank's lines are missing) gives up at
+the build's deadline, a grid barrier a grace later, and an exchange wait missing
+a peer's line two graces later. A stuck GPU's page then names the hand-off that
+never came (0x3000, 0x2000), or a grid barrier only when no hand-off or line of
+its own was missing (a CTA that never arrived, as when not every CTA is resident,
+or one waiting on a peer's line); a GPU waiting on a stuck peer faults at the
+flag's page.
 """
 
 from __future__ import annotations
@@ -72,6 +80,12 @@ SLOT_WORDS = STRIPES * STRIPE_WORDS  # a launch slot's barrier counters
 FOLD_BASE = 2 * SLOT_WORDS  # the fold counters follow both slots' stripes
 FOLD_STRIDE = 16  # a fold counter's words: one 64-byte line
 FOLD_COUNTERS = 512
+# stop mode's deadline grace, an eighth of the deadline (`deadlines`): far above a
+# wait's check period (`CHECK_POLLS` polls, microseconds) and the start skew between
+# a wait and the waits behind it (within a launch, milliseconds), and the latest
+# deadline, 1.25 times SGLang's (half the watchdog, at most 60 s), stays below the
+# watchdog
+GRACES = 8
 
 
 def sync_words() -> int:
@@ -218,13 +232,26 @@ def pending(pend, stall):
     return pend if stall is None else pend | stall
 
 
+def deadlines(g, site):
+    """A stop-mode wait's deadlines in ticks (the module docstring): the wait's
+    at `site` (the build's, a grid barrier's a grace later), and an exchange
+    wait's while a peer's line is missing (two graces later)."""
+    grace = g.ticks // GRACES
+    return g.ticks + (grace if site == SITE_GRID else 0), g.ticks + 2 * grace
+
+
 @traced
-def check(g, t0, site, leader=None):
-    """A pending stop-mode wait's check (every `CHECK_POLLS` polls): past the
-    deadline from `t0`, `fail_stop` at `site` (on the `leader` lanes when given);
-    a set word in this rank's flags faults the launch at `SITE_FLAG`. With no
-    peer (one rank) nothing writes this rank's flags, so they are not read."""
-    late = memrealtime() - t0 > fx.Int64(g.ticks)
+def check(g, t0, site, leader=None, peer=None):
+    """A pending stop-mode wait's check (every `CHECK_POLLS` polls): past its
+    deadline from `t0` (`deadlines`; `peer`: whether a peer's line is missing),
+    `fail_stop` at `site` (on the `leader` lanes when given); a set word in this
+    rank's flags faults the launch at `SITE_FLAG`. With no peer (one rank)
+    nothing writes this rank's flags, so they are not read."""
+    own, peers = deadlines(g, site)
+    limit = fx.Int64(own)
+    if const_expr(peer is not None):
+        limit = peer.select(fx.Int64(peers), limit)
+    late = memrealtime() - t0 > limit
     if const_expr(leader is not None):
         late = late & leader
     if late:

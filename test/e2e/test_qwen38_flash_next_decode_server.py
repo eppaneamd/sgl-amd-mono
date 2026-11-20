@@ -99,11 +99,16 @@ CHECK_METRICS = (
     "qsa.qkv.cosine",
     "qsa.ix.cosine",
 )
-# The fault test: a stopped launch faults at its wait kind's page (a grid barrier,
-# a TP exchange line, a tagged hand-off between CTAs), or at the flag's for a peer's
-# flag
-WAIT_PAGES = {0x1000, 0x2000, 0x3000}
-FLAG_PAGE = 0x4000
+# The fault test: rank 1's launches stall at their second wait once the step epoch
+# reaches 1000 (startup's graph warmups run a few steps of each width). The first is
+# layer 0's, a stats build, whose waits at the request's 1 row run (trace order) the
+# stats phase's grid barrier, then the attention mix's split-K partials, a tagged
+# hand-off (`hc._down_unit`'s `tagged.poll`). Rank 1 faults at the hand-off's page
+# (its grid barriers give up a grace later), rank 0 at the flag's (its own waits give
+# up a grace or two later). SGLang's teardown after rank 1's fault can cut rank 0's
+# report off (earlier runs of this test logged rank 1's alone), so it may be missing
+FAULT_INJECT = "1:2:1000"
+FAULT_PAGES = ({0x3000, 0x4000}, {0x3000})
 
 
 def _launch(mono=True, extra_env=None, extra_args=(), log=None):
@@ -305,17 +310,15 @@ class TestMonokernelCheck(CustomTestCase):
 
 class TestMonokernelFault(CustomTestCase):
     def test_a_stalled_rank_stops_the_server_without_tokens(self):
-        # once the step epoch reaches 1000 (startup's graph warmups run a few steps
-        # of each width), rank 1 stalls at the first wait of its launches; at the
-        # deadline (watchdog / 2) it raises its flag and both ranks stop: rank 1 at
-        # its wait kind's page, rank 0 at the flag's
+        # rank 1 stalls at a tagged hand-off (FAULT_INJECT); at the deadline
+        # (watchdog / 2) it raises its flag and both ranks stop, at FAULT_PAGES
         with (
             tempfile.NamedTemporaryFile("w+", suffix=".out") as out,
             tempfile.NamedTemporaryFile("w+", suffix=".err") as err,
         ):
             process = _launch(
                 extra_env={
-                    "SGLANG_AMD_MONO_FAULT_INJECT": "1:1:1000",
+                    "SGLANG_AMD_MONO_FAULT_INJECT": FAULT_INJECT,
                     # the stop faults every GPU on purpose: no crash dumps, which
                     # would hold the ranks up for minutes
                     "HSA_DISABLE_COREDUMP_ON_EXCEPTION": "1",
@@ -349,8 +352,7 @@ class TestMonokernelFault(CustomTestCase):
                 self.assertIsNotNone(process.poll(), "the server kept running")
                 log = _logs((out, err))
                 # a launch stops with a store to its wait kind's page (CLR's
-                # "faulting addr: 0x...", ROCr's "on address 0x..."): the only
-                # faults are there, rank 0's at the flag's page
+                # "faulting addr: 0x...", ROCr's "on address 0x...")
                 faults = {
                     0 if a == "(nil)" else int(a, 16)
                     for a in re.findall(
@@ -358,10 +360,7 @@ class TestMonokernelFault(CustomTestCase):
                         log,
                     )
                 }
-                self.assertTrue(faults, log[-2000:])
-                self.assertLessEqual(faults, WAIT_PAGES | {FLAG_PAGE}, faults)
-                self.assertIn(FLAG_PAGE, faults)
-                self.assertTrue(faults & WAIT_PAGES, faults)
+                self.assertIn(faults, FAULT_PAGES, log[-2000:])
             finally:
                 terminate_and_kill_process_tree(process)
 

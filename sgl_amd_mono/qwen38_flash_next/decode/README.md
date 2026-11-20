@@ -55,14 +55,23 @@ Default-deny, each stage listing every reason (`spec.py`), the TP ranks agreeing
 
 ## Failure
 
-Every in-kernel wait (grid barrier, TP exchange line, tagged hand-off) gives up at SGLang's deadline
-(`BuildContext.deadline_s`, half the watchdog timeout, at most 60 s). In stop mode the CTA raises its rank's flag in
-every other rank's peer buffer (the first `PEER_HEAD` bytes, zeroed at allocation and written by nothing else) and
-faults the launch at its wait kind's page: address 0x1000 a grid barrier, 0x2000 a TP exchange line, 0x3000 a tagged
-hand-off between the launch's CTAs (`wide/stages/tagged.py`). A rank whose wait finds a peer's flag up faults at
-0x4000, without waiting for its own deadline. The runtime reports a queue's first fault (CLR's "faulting addr", ROCr's
-"on address"), so a rank does not raise its own flag: its GPU's report names the kind of wait that timed out first
-there. That can be a wait behind the stuck one, such as a grid barrier after a hand-off that never came.
+Every in-kernel wait (grid barrier, TP exchange line, tagged hand-off) gives up at SGLang's deadline D
+(`BuildContext.deadline_s`, half the watchdog timeout, at most 60 s), or a grace of D/8 or two later: a tagged hand-off,
+or an exchange line while only the rank's own lines are missing, at D; a grid barrier at 1.125 D; an exchange line while
+a peer's line is missing at 1.25 D (`wide.common.grid.deadlines`): past the deadline SGLang hands the plugin, but at
+most 0.625 of the watchdog timeout. In stop mode the CTA raises its rank's flag in every other rank's peer buffer (the
+first `PEER_HEAD` bytes, zeroed at allocation and written by nothing else) and faults the launch at its wait kind's
+page; a rank whose wait finds a peer's flag up faults at 0x4000, without waiting for its own deadline. The runtime
+reports a queue's first fault (CLR's "faulting addr", ROCr's "on address"), so a rank does not raise its own flag, and
+the staggered deadlines make the first wait to give up on a GPU one of the kind furthest upstream:
+
+| a GPU's fault at | its first wait to give up | meaning |
+| --- | --- | --- |
+| 0x3000 | a tagged hand-off between the launch's CTAs (`wide/stages/tagged.py`, such as split-K partials) | a CTA of this GPU never handed off its values |
+| 0x2000 | a TP exchange line | a line never came: of this rank (a CTA of its own never wrote it), or of a peer |
+| 0x1000 | a grid barrier | no hand-off or line of its own was missing: a CTA never arrived (not every CTA resident, or one waits on a peer's line) |
+| 0x4000 | a peer's flag | another rank gave up first; its page names the stall |
+
 `SGLANG_AMD_MONO_FAULT_INJECT=rank:site:after` stalls a wait of that rank's launches once the step epoch reaches
 `after` (test only).
 
